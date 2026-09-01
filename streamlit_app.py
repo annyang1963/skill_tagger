@@ -18,7 +18,6 @@ import classroom_content
 
 APP_DIR = Path(__file__).resolve().parent
 SECRETS_PATH = APP_DIR / ".streamlit" / "secrets.toml"
-APP_PASSWORD = "skill_tagging"
 
 st.set_page_config(
     page_title="Concept Skill Tagger",
@@ -42,7 +41,7 @@ def _app_password() -> str:
             return value
     except (KeyError, FileNotFoundError, AttributeError, TypeError):
         pass
-    return _secrets_from_toml().get("APP_PASSWORD", "").strip() or APP_PASSWORD
+    return _secrets_from_toml().get("APP_PASSWORD", "").strip()
 
 
 def _check_password() -> bool:
@@ -50,13 +49,21 @@ def _check_password() -> bool:
     if st.session_state.get("authenticated"):
         return True
 
+    expected = _app_password()
+    if not expected:
+        st.error(
+            f"Set `APP_PASSWORD` in `{SECRETS_PATH}`. "
+            "The password is local-only and is not stored in the repo."
+        )
+        return False
+
     st.title("Concept Skill Tagger")
     st.caption("Enter the password to continue.")
     with st.form("login"):
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Log in")
     if submitted:
-        if password and hmac.compare_digest(password, _app_password()):
+        if password and hmac.compare_digest(password, expected):
             st.session_state.authenticated = True
             st.rerun()
         st.error("Incorrect password.")
