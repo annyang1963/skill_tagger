@@ -1,0 +1,14 @@
+# Local secrets
+.streamlit/secrets.toml
+.env
+.env.*
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS
+.DS_Store
