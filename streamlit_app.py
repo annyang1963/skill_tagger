@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import hmac
 import io
 import json
 import tomllib
@@ -17,6 +18,7 @@ import classroom_content
 
 APP_DIR = Path(__file__).resolve().parent
 SECRETS_PATH = APP_DIR / ".streamlit" / "secrets.toml"
+APP_PASSWORD = "skill_tagging"
 
 st.set_page_config(
     page_title="Concept Skill Tagger",
@@ -31,6 +33,38 @@ def _secrets_from_toml() -> dict[str, str]:
     with SECRETS_PATH.open("rb") as f:
         data = tomllib.load(f)
     return {k: str(v).strip() for k, v in data.items() if isinstance(v, str)}
+
+
+def _app_password() -> str:
+    try:
+        value = str(st.secrets["APP_PASSWORD"]).strip()
+        if value:
+            return value
+    except (KeyError, FileNotFoundError, AttributeError, TypeError):
+        pass
+    return _secrets_from_toml().get("APP_PASSWORD", "").strip() or APP_PASSWORD
+
+
+def _check_password() -> bool:
+    """Return True once the shared app password has been entered this session."""
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.title("Concept Skill Tagger")
+    st.caption("Enter the password to continue.")
+    with st.form("login"):
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Log in")
+    if submitted:
+        if password and hmac.compare_digest(password, _app_password()):
+            st.session_state.authenticated = True
+            st.rerun()
+        st.error("Incorrect password.")
+    return False
+
+
+if not _check_password():
+    st.stop()
 
 
 def _load_secrets() -> tuple[str, str]:
