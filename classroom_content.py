@@ -6,6 +6,7 @@ import json
 import math
 import re
 import tarfile
+import urllib.parse
 from collections import Counter
 from pathlib import PurePosixPath
 from typing import Any
@@ -29,6 +30,10 @@ TEXT_EXTENSIONS = frozenset({
     ".sh", ".yaml", ".yml", ".sql", ".r", ".xml", ".toml", ".ini", ".cfg",
 })
 SKIP_ARCHIVE_DIRS = frozenset({"node_modules", ".git", "__pycache__", ".venv", "venv"})
+# Query params of a workspace launch URL that name the file/folder opened for the learner.
+DEFAULT_PATH_QUERY_KEYS = ("folder", "file", "path")
+# Query params holding a JSON launch config rather than a path.
+DEFAULT_PATH_CONFIG_KEYS = ("ulab", "blueprint")
 
 QUERIES = """
 query ComponentsByKey($key: String!) {
@@ -47,6 +52,7 @@ query ComponentsByKey($key: String!) {
 query ComponentByKey($key: String!, $locale: String!) {
   component(key: $key, locale: $locale) {
     latest_release {
+      id
       major
       minor
       patch
@@ -65,6 +71,17 @@ query ComponentByKey($key: String!, $locale: String!) {
           prerequisite_skills { name uri }
         }
       }
+      dependencies {
+        parent_node_id
+        current {
+          root_node_id
+          component {
+            key
+            type
+            title
+          }
+        }
+      }
     }
   }
 }
@@ -75,12 +92,28 @@ query ConstructionByKey($key: String!, $locale: String!) {
     key
     title
     semantic_type
+    branch_id
   }
   component(key: $key, locale: $locale) {
     metadata {
       difficulty_level { name uri }
       teaches_skills { name uri }
       prerequisite_skills { name uri }
+    }
+    branches(type: "CONSTRUCTION") {
+      id
+      root_node_id
+      dependencies {
+        parent_node_id
+        current {
+          root_node_id
+          component {
+            key
+            type
+            title
+          }
+        }
+      }
     }
   }
 }
@@ -91,6 +124,7 @@ fragment conceptFields on Concept {
   title
   is_public
   progress_key
+  branch_id
   atoms {
     __typename
     ... on AtomInterface {
@@ -150,6 +184,8 @@ fragment lessonFields on Lesson {
   title
   summary
   is_project_lesson
+  semantic_type
+  branch_id
   concepts { ...conceptFields }
 }
 
@@ -157,6 +193,8 @@ fragment moduleFields on Module {
   id
   key
   title
+  semantic_type
+  branch_id
   lessons { ...lessonFields }
 }
 
@@ -167,6 +205,8 @@ fragment partFields on Part {
   summary
   is_optional
   is_public
+  semantic_type
+  branch_id
   modules { ...moduleFields }
 }
 
@@ -178,6 +218,7 @@ query NodeById($id: Int!) {
     locale
     version
     semantic_type
+    branch_id
     ... on Nanodegree {
       summary
       syllabus_overview
@@ -264,10 +305,15 @@ def _construction_release(jwt: str, key: str, locale: str) -> dict[str, Any] | N
     node = data.get("node")
     if not node or not node.get("id"):
         return None
+    component = data.get("component") or {}
+    branches = component.get("branches") or []
+    construction_branch = branches[0] if branches else {}
     return {
+        "id": construction_branch.get("id") or node.get("branch_id"),
         "root_node_id": node.get("id"),
         "root_node": {"id": node.get("id"), "title": node.get("title")},
-        "component": {"metadata": (data.get("component") or {}).get("metadata")},
+        "component": {"metadata": component.get("metadata")},
+        "dependencies": construction_branch.get("dependencies") or [],
         "_unreleased": True,
     }
 
@@ -391,6 +437,8 @@ def resolve_program(jwt: str, program_key: str) -> dict[str, Any]:
     node["_kind"] = node.get("semantic_type") or "Unknown"
     node["_metadata"] = metadata
     node["_unreleased"] = release.get("_unreleased", False)
+    node["_branch_id"] = release.get("id") or node.get("branch_id")
+    node["_child_components"] = _child_components_from_release(release)
     return node
 
 
@@ -492,19 +540,151 @@ def _should_skip_archive_path(path: str) -> bool:
     return suffix not in TEXT_EXTENSIONS
 
 
-def _extract_text_from_archive(data: bytes, *, max_chars: int = WORKSPACE_FILES_MAX_CHARS) -> str:
-    """Extract readable text from a masterfiles tar.gz archive."""
+def _default_path_target(main_default_path: str | None) -> str | None:
+    """Resolve the folder/file a concept opens for the learner, or None if it opens the root.
+
+    main_default_path is a workspace launch URL. Modern code-server workspaces use
+    `/?folder=%2Fworkspace%2F<dir>`, legacy Jupyter ones a bare `/notebooks/<file>`, and
+    legacy ulab/blueprint blobs a JSON config whose defaultPath is the workspace root.
+    """
+    raw = (main_default_path or "").strip()
+    if not raw:
+        return None
+
+    parsed = urllib.parse.urlparse(raw)
+    query = urllib.parse.parse_qs(parsed.query)
+    candidate = ""
+
+    for key in DEFAULT_PATH_QUERY_KEYS:
+        values = query.get(key) or []
+        if values and values[0].strip():
+            candidate = values[0]
+            break
+
+    if not candidate:
+        for key in DEFAULT_PATH_CONFIG_KEYS:
+            values = query.get(key) or []
+            if not values:
+                continue
+            try:
+                blob = json.loads(urllib.parse.unquote(values[0]))
+            except (TypeError, ValueError):
+                return None
+            if isinstance(blob, dict):
+                candidate = str(blob.get("defaultPath") or "")
+            break
+
+    if not candidate and not query:
+        candidate = parsed.path
+
+    candidate = urllib.parse.unquote(candidate or "")
+    parts = [p for p in candidate.split("/") if p and p not in (".", "..")]
+    return "/".join(parts) or None
+
+
+def _normalize_archive_name(name: str) -> str:
+    """Archive members are stored as './a/b'; compare them as 'a/b'."""
+    normalized = (name or "").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.strip("/")
+
+
+def _resolve_archive_scope(names: set[str], target: str) -> list[str]:
+    """Map a default path onto the archive paths it refers to.
+
+    The default path is rooted at the container (`/workspace/...`, `/notebooks/...`)
+    while the archive is rooted at the repo, so leading segments are dropped one at a
+    time until a segment suffix matches. Returns [] when nothing matches.
+    """
+    parts = [p for p in target.split("/") if p]
+    for start in range(len(parts)):
+        candidate = "/".join(parts[start:])
+        roots: set[str] = set()
+        for name in names:
+            if name == candidate or name.startswith(candidate + "/"):
+                roots.add(candidate)
+                continue
+            marker = "/" + candidate
+            if name.endswith(marker):
+                roots.add(name)
+                continue
+            index = name.find(marker + "/")
+            if index != -1:
+                roots.add(name[: index + len(marker)])
+        if roots:
+            return sorted(roots)
+    return []
+
+
+def _is_within_scope(name: str, roots: list[str]) -> bool:
+    return any(name == root or name.startswith(root + "/") for root in roots)
+
+
+def _is_readme(name: str) -> bool:
+    return PurePosixPath(name).name.lower().startswith("readme")
+
+
+def _ancestor_doc_paths(names: set[str], roots: list[str]) -> set[str]:
+    """READMEs in folders above the exercise folder — they carry the task description."""
+    ancestors: set[str] = set()
+    for root in roots:
+        parts = root.split("/")
+        for depth in range(len(parts)):
+            ancestors.add("/".join(parts[:depth]))
+    docs: set[str] = set()
+    for name in names:
+        if not _is_readme(name) or _is_within_scope(name, roots):
+            continue
+        parent = name.rsplit("/", 1)[0] if "/" in name else ""
+        if parent in ancestors:
+            docs.add(name)
+    return docs
+
+
+def _extract_text_from_archive(
+    data: bytes,
+    *,
+    scope_target: str | None = None,
+    max_chars: int = WORKSPACE_FILES_MAX_CHARS,
+) -> tuple[str, dict[str, Any]]:
+    """Extract readable text from a masterfiles tar.gz archive.
+
+    A workspace often holds one folder per exercise while a concept practices only one
+    of them, so when scope_target resolves inside the archive only that folder (plus
+    ancestor READMEs) is read. Falls back to the whole archive when it does not resolve.
+    """
+    info: dict[str, Any] = {
+        "scope_target": scope_target or "",
+        "scope_paths": [],
+        "scoped": False,
+    }
     if not data:
-        return ""
+        return "", info
+
     chunks: list[str] = []
     total = 0
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-            for member in tar.getmembers():
-                if not member.isfile():
+            members = [m for m in tar.getmembers() if m.isfile()]
+            names = {_normalize_archive_name(m.name) for m in members}
+
+            roots = _resolve_archive_scope(names, scope_target) if scope_target else []
+            docs = _ancestor_doc_paths(names, roots) if roots else set()
+            info["scope_paths"] = roots
+            info["scoped"] = bool(roots)
+
+            selected = []
+            for member in members:
+                name = _normalize_archive_name(member.name)
+                if roots and not (_is_within_scope(name, roots) or name in docs):
                     continue
-                path = member.name or ""
-                if _should_skip_archive_path(path):
+                selected.append((name, member))
+            # In-scope files first so truncation never drops the exercise for a README.
+            selected.sort(key=lambda item: (item[0] in docs, item[0]))
+
+            for name, member in selected:
+                if _should_skip_archive_path(name):
                     continue
                 if member.size > WORKSPACE_FILE_MAX_BYTES:
                     continue
@@ -515,10 +695,10 @@ def _extract_text_from_archive(data: bytes, *, max_chars: int = WORKSPACE_FILES_
                     raw = extracted.read()
                 except Exception:
                     continue
-                text = _clean(_archive_member_text(path, raw))
+                text = _clean(_archive_member_text(name, raw))
                 if not text:
                     continue
-                block = f"[path: {path}] {text}"
+                block = f"[path: {name}] {text}"
                 if total + len(block) > max_chars:
                     remaining = max_chars - total
                     if remaining > 50:
@@ -527,42 +707,44 @@ def _extract_text_from_archive(data: bytes, *, max_chars: int = WORKSPACE_FILES_
                 chunks.append(block)
                 total += len(block)
     except Exception:
-        return ""
-    return "\n".join(chunks)
+        return "", info
+    return "\n".join(chunks), info
 
 
 def _workspace_files_for_atom(
     atom: dict[str, Any],
     jwt: str,
-    cache: dict[tuple[int, str, str], str],
-) -> str:
+    cache: dict[tuple[int, str, str], bytes],
+) -> tuple[str, dict[str, Any]]:
+    """Return (text, scope info) for this atom's slice of the workspace masterfiles.
+
+    The archive bytes are cached, not the extracted text: concepts sharing a workspace
+    each scope to a different exercise folder, so one download serves all of them.
+    """
+    empty_info: dict[str, Any] = {"scope_target": "", "scope_paths": [], "scoped": False}
     workspace_id = atom.get("workspace_id")
     branch_id = atom.get("branch_id")
     if not workspace_id or not branch_id:
-        return ""
+        return "", empty_info
     try:
         branch_int = int(branch_id)
     except (TypeError, ValueError):
-        return ""
+        return "", empty_info
 
     master_key = str(atom.get("master_archive_id") or "")
     cache_key = (branch_int, str(workspace_id), master_key)
     if cache_key in cache:
-        return cache[cache_key]
+        archive_bytes = cache[cache_key]
+    else:
+        download_url = _fetch_masterfiles_download_url(jwt, str(workspace_id), branch_int)
+        archive_bytes = _download_url_bytes(download_url) if download_url else b""
+        cache[cache_key] = archive_bytes
 
-    download_url = _fetch_masterfiles_download_url(jwt, str(workspace_id), branch_int)
-    if not download_url:
-        cache[cache_key] = ""
-        return ""
-
-    archive_bytes = _download_url_bytes(download_url)
     if not archive_bytes:
-        cache[cache_key] = ""
-        return ""
+        return "", empty_info
 
-    text = _extract_text_from_archive(archive_bytes)
-    cache[cache_key] = text
-    return text
+    scope_target = _default_path_target(atom.get("main_default_path"))
+    return _extract_text_from_archive(archive_bytes, scope_target=scope_target)
 
 
 def _is_workspace_atom(atom: dict[str, Any]) -> bool:
@@ -571,7 +753,12 @@ def _is_workspace_atom(atom: dict[str, Any]) -> bool:
     return typ == "workspaceatom" or semantic in ("workspaceatom", "workspace")
 
 
-def _atom_text(atom: dict[str, Any], *, workspace_files_text: str = "") -> str:
+def _atom_text(
+    atom: dict[str, Any],
+    *,
+    workspace_files_text: str = "",
+    workspace_scope: dict[str, Any] | None = None,
+) -> str:
     semantic = atom.get("semantic_type") or atom.get("__typename") or ""
     title = atom.get("title") or ""
     parts: list[str] = []
@@ -599,7 +786,15 @@ def _atom_text(atom: dict[str, Any], *, workspace_files_text: str = "") -> str:
             except (TypeError, ValueError):
                 parts.append(f"configuration: {str(config)[:2000]}")
         if workspace_files_text:
-            parts.append(f"[WorkspaceAtom files] {workspace_files_text}")
+            scope_paths = (workspace_scope or {}).get("scope_paths") or []
+            if scope_paths:
+                label = (
+                    "[WorkspaceAtom files — exercise folder for this concept: "
+                    f"{'; '.join(scope_paths)}]"
+                )
+            else:
+                label = "[WorkspaceAtom files]"
+            parts.append(f"{label} {workspace_files_text}")
 
     question = atom.get("question")
     if isinstance(question, dict):
@@ -652,49 +847,196 @@ def _concept_has_workspace(concept: dict[str, Any]) -> bool:
 def _build_concept_context(
     concept: dict[str, Any],
     jwt: str,
-    masterfiles_cache: dict[tuple[int, str, str], str],
-) -> tuple[str, bool, int]:
+    masterfiles_cache: dict[tuple[int, str, str], bytes],
+) -> tuple[str, bool, int, dict[str, Any]]:
     lines: list[str] = []
     files_included = False
     files_chars = 0
+    scope_paths: list[str] = []
+    scope_targets: list[str] = []
+    unresolved = False
+
     for atom in concept.get("atoms") or []:
         workspace_files = ""
+        scope: dict[str, Any] = {}
         if _is_workspace_atom(atom) and jwt:
-            workspace_files = _workspace_files_for_atom(atom, jwt, masterfiles_cache)
+            workspace_files, scope = _workspace_files_for_atom(atom, jwt, masterfiles_cache)
             if workspace_files:
                 files_included = True
                 files_chars += len(workspace_files)
-        text = _atom_text(atom, workspace_files_text=workspace_files)
+                target = scope.get("scope_target") or ""
+                if target:
+                    scope_targets.append(target)
+                if scope.get("scoped"):
+                    scope_paths.extend(scope.get("scope_paths") or [])
+                elif target:
+                    unresolved = True
+        text = _atom_text(atom, workspace_files_text=workspace_files, workspace_scope=scope)
         if text:
             lines.append(text)
-    return "\n".join(lines), files_included, files_chars
+
+    if scope_paths:
+        status = "scoped"
+    elif unresolved:
+        status = "unresolved"
+    elif files_included:
+        status = "full_workspace"
+    else:
+        status = ""
+
+    scope_info = {
+        "workspace_scope_status": status,
+        "workspace_scope_paths": scope_paths,
+        "workspace_default_paths": scope_targets,
+    }
+    return "\n".join(lines), files_included, files_chars, scope_info
+
+
+def _child_components_from_release(release: dict[str, Any] | None) -> dict[int, dict[str, str]]:
+    """Map each nested child-component root_node_id to {key, type, title}."""
+    out: dict[int, dict[str, str]] = {}
+    if not release:
+        return out
+    for dep in release.get("dependencies") or []:
+        if not isinstance(dep, dict):
+            continue
+        current = dep.get("current") or {}
+        root_id = current.get("root_node_id")
+        if root_id is None:
+            continue
+        comp = current.get("component") or dep.get("component") or {}
+        out[int(root_id)] = {
+            "key": (comp.get("key") or "").strip(),
+            "type": (comp.get("type") or "").strip(),
+            "title": (comp.get("title") or "").strip(),
+        }
+    return out
+
+
+def _enclosing_child_component(
+    node: dict[str, Any] | None,
+    enclosing: dict[str, str] | None,
+    child_by_root_id: dict[int, dict[str, str]],
+    parent_branch_id: int | None,
+) -> dict[str, str] | None:
+    """Return the child component this node belongs to, if any.
+
+    Prefers an explicit GraphQL dependency whose root is this node (so a nested
+    ls inside a cd is more specific than the enclosing cd). Falls back to a
+    branch_id mismatch when dependency data is missing.
+    """
+    if not node:
+        return enclosing
+    nid = node.get("id")
+    if nid is not None:
+        try:
+            matched = child_by_root_id.get(int(nid))
+        except (TypeError, ValueError):
+            matched = None
+        if matched:
+            return matched
+    nkey = (node.get("key") or "").strip()
+    if nkey:
+        for child in child_by_root_id.values():
+            if child.get("key") == nkey:
+                return child
+    if enclosing is not None:
+        return enclosing
+    bid = node.get("branch_id")
+    if parent_branch_id is None or bid is None:
+        return None
+    try:
+        if int(bid) == int(parent_branch_id):
+            return None
+    except (TypeError, ValueError):
+        return None
+    return {
+        "key": (node.get("key") or "").strip(),
+        "type": (node.get("semantic_type") or "").strip(),
+        "title": (node.get("title") or "").strip(),
+    }
+
+
+def _skip_reason_for_child(child: dict[str, str]) -> str:
+    key = child.get("key") or ""
+    title = child.get("title") or ""
+    if key and title:
+        label = f"{key} ({title})"
+    else:
+        label = key or title or "unknown"
+    return (
+        f"Skill tagging skipped because this concept is in child component {label}."
+    )
+
+
+def _workspace_concept_record(
+    concept: dict[str, Any],
+    lesson: dict[str, Any],
+    *,
+    context: str = "",
+    files_included: bool = False,
+    files_chars: int = 0,
+    child: dict[str, str] | None = None,
+    scope_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    skipped = child is not None
+    scope = scope_info or {}
+    return {
+        "concept_key": concept.get("key") or "",
+        "concept_title": concept.get("title") or "",
+        "lesson_key": lesson.get("key") or "",
+        "lesson_title": lesson.get("title") or "",
+        "context_text": context,
+        "workspace_files_included": files_included,
+        "workspace_files_chars": files_chars,
+        "workspace_scope_status": scope.get("workspace_scope_status", ""),
+        "workspace_scope_paths": scope.get("workspace_scope_paths") or [],
+        "workspace_default_paths": scope.get("workspace_default_paths") or [],
+        "skipped": skipped,
+        "skip_reason": _skip_reason_for_child(child) if child else "",
+        "child_component_key": (child or {}).get("key") or "",
+        "child_component_type": (child or {}).get("type") or "",
+        "child_component_title": (child or {}).get("title") or "",
+    }
 
 
 def _walk_lessons_for_workspace(
     lessons: list[dict[str, Any]],
     jwt: str,
-    masterfiles_cache: dict[tuple[int, str, str], str],
+    masterfiles_cache: dict[tuple[int, str, str], bytes],
+    *,
+    child_by_root_id: dict[int, dict[str, str]],
+    parent_branch_id: int | None,
+    enclosing_child: dict[str, str] | None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for lesson in lessons or []:
-        lesson_key = lesson.get("key") or ""
-        lesson_title = lesson.get("title") or ""
+        child = _enclosing_child_component(
+            lesson, enclosing_child, child_by_root_id, parent_branch_id
+        )
         for concept in lesson.get("concepts") or []:
             if not _concept_has_workspace(concept):
                 continue
-            context, files_included, files_chars = _build_concept_context(
+            concept_child = _enclosing_child_component(
+                concept, child, child_by_root_id, parent_branch_id
+            )
+            if concept_child:
+                results.append(
+                    _workspace_concept_record(concept, lesson, child=concept_child)
+                )
+                continue
+            context, files_included, files_chars, scope_info = _build_concept_context(
                 concept, jwt, masterfiles_cache
             )
             results.append(
-                {
-                    "concept_key": concept.get("key") or "",
-                    "concept_title": concept.get("title") or "",
-                    "lesson_key": lesson_key,
-                    "lesson_title": lesson_title,
-                    "context_text": context,
-                    "workspace_files_included": files_included,
-                    "workspace_files_chars": files_chars,
-                }
+                _workspace_concept_record(
+                    concept,
+                    lesson,
+                    context=context,
+                    files_included=files_included,
+                    files_chars=files_chars,
+                    scope_info=scope_info,
+                )
             )
     return results
 
@@ -703,33 +1045,61 @@ def extract_workspace_concepts(
     program: dict[str, Any],
     jwt: str,
 ) -> list[dict[str, Any]]:
-    """Find all concepts containing a WorkspaceAtom and extract atom + starter file context."""
-    masterfiles_cache: dict[tuple[int, str, str], str] = {}
+    """Find workspace concepts owned by this component; skip nested child components."""
+    masterfiles_cache: dict[tuple[int, str, str], bytes] = {}
     concepts: list[dict[str, Any]] = []
+    child_by_root_id = program.get("_child_components") or {}
+    parent_branch_id = program.get("_branch_id")
+    try:
+        parent_branch_id = int(parent_branch_id) if parent_branch_id is not None else None
+    except (TypeError, ValueError):
+        parent_branch_id = None
+
     nd_parts = [p for p in (program.get("parts") or []) if p and p.get("key")]
     part_modules = program.get("modules") or []
 
+    def walk(
+        lessons: list[dict[str, Any]] | None,
+        enclosing: dict[str, str] | None,
+    ) -> None:
+        concepts.extend(
+            _walk_lessons_for_workspace(
+                lessons or [],
+                jwt,
+                masterfiles_cache,
+                child_by_root_id=child_by_root_id,
+                parent_branch_id=parent_branch_id,
+                enclosing_child=enclosing,
+            )
+        )
+
     if nd_parts:
         for part in nd_parts:
-            for module in part.get("modules") or []:
-                concepts.extend(
-                    _walk_lessons_for_workspace(
-                        module.get("lessons"), jwt, masterfiles_cache
-                    )
-                )
-    elif part_modules:
-        for module in part_modules:
-            concepts.extend(
-                _walk_lessons_for_workspace(module.get("lessons"), jwt, masterfiles_cache)
+            part_child = _enclosing_child_component(
+                part, None, child_by_root_id, parent_branch_id
             )
+            for module in part.get("modules") or []:
+                module_child = _enclosing_child_component(
+                    module, part_child, child_by_root_id, parent_branch_id
+                )
+                walk(module.get("lessons"), module_child)
+    elif part_modules:
+        program_child = _enclosing_child_component(
+            program, None, child_by_root_id, parent_branch_id
+        )
+        for module in part_modules:
+            module_child = _enclosing_child_component(
+                module, program_child, child_by_root_id, parent_branch_id
+            )
+            walk(module.get("lessons"), module_child)
     elif program.get("concepts"):
-        concepts.extend(
-            _walk_lessons_for_workspace([program], jwt, masterfiles_cache)
-        )
+        # Analyzing a lesson component directly — its concepts are in-component.
+        walk([program], None)
     else:
-        concepts.extend(
-            _walk_lessons_for_workspace(program.get("lessons") or [], jwt, masterfiles_cache)
+        program_child = _enclosing_child_component(
+            program, None, child_by_root_id, parent_branch_id
         )
+        walk(program.get("lessons") or [], program_child)
     return concepts
 
 
@@ -775,13 +1145,21 @@ def _build_user_prompt(
     allowed_skills: list[str],
 ) -> str:
     skill_lines = "\n".join(f"- {s}" for s in allowed_skills)
+    scope_paths = concept.get("workspace_scope_paths") or []
+    scope_note = ""
+    if scope_paths:
+        scope_note = (
+            "The workspace files below are only the exercise folder this concept opens "
+            f"({'; '.join(scope_paths)}), not the whole workspace.\n"
+        )
     return (
         f"PROGRAM: {program_key} — {program_title}\n"
         f"ALLOWED SKILLS (pick 1–3 exact names from this list only):\n{skill_lines}\n\n"
         f"CONCEPT: {concept.get('concept_title', '')} (key: {concept.get('concept_key', '')})\n"
         "This concept includes a workspace activity. Tag skills the learner will practice, "
         "apply, or be meaningfully exposed to by engaging with the workspace and related "
-        "content—not general program themes unrelated to this concept.\n\n"
+        "content—not general program themes unrelated to this concept.\n"
+        f"{scope_note}\n"
         f"CONTENT:\n{concept.get('context_text', '') or '(no extractable content)'}"
     )
 
@@ -979,6 +1357,9 @@ def tag_concept(
             "llm_input_text": user_prompt,
             "workspace_files_included": concept.get("workspace_files_included", False),
             "workspace_files_chars": concept.get("workspace_files_chars", 0),
+            "workspace_scope_status": concept.get("workspace_scope_status", ""),
+            "workspace_scope_paths": concept.get("workspace_scope_paths") or [],
+            "workspace_default_paths": concept.get("workspace_default_paths") or [],
             "consensus_skills": outcome["consensus_skills"],
             "run_skills": outcome["run_skills"],
             "skill_votes": outcome["skill_votes"],
@@ -987,6 +1368,11 @@ def tag_concept(
             "rationale": outcome["rationale"],
             "validation_status": outcome["validation_status"],
             "validation_errors": outcome["validation_errors"],
+            "skipped": False,
+            "skip_reason": "",
+            "child_component_key": "",
+            "child_component_type": "",
+            "child_component_title": "",
         }
 
     # Single run
@@ -1005,6 +1391,9 @@ def tag_concept(
         "llm_input_text": user_prompt,
         "workspace_files_included": concept.get("workspace_files_included", False),
         "workspace_files_chars": concept.get("workspace_files_chars", 0),
+        "workspace_scope_status": concept.get("workspace_scope_status", ""),
+        "workspace_scope_paths": concept.get("workspace_scope_paths") or [],
+        "workspace_default_paths": concept.get("workspace_default_paths") or [],
         "consensus_skills": skills,
         "run_skills": [skills] if skills else [],
         "skill_votes": {s: 1 for s in skills},
@@ -1013,6 +1402,45 @@ def tag_concept(
         "rationale": _normalize_rationale(parsed.rationale) if parsed else "",
         "validation_status": status,
         "validation_errors": [err] if err else [],
+        "skipped": False,
+        "skip_reason": "",
+        "child_component_key": "",
+        "child_component_type": "",
+        "child_component_title": "",
+    }
+
+
+def _skipped_tag_result(concept: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "concept_key": concept.get("concept_key", ""),
+        "concept_title": concept.get("concept_title", ""),
+        "lesson_key": concept.get("lesson_key", ""),
+        "lesson_title": concept.get("lesson_title", ""),
+        "context_text": "",
+        "llm_input_text": "",
+        "workspace_files_included": False,
+        "workspace_files_chars": 0,
+        "workspace_scope_status": "",
+        "workspace_scope_paths": [],
+        "workspace_default_paths": [],
+        "consensus_skills": [],
+        "run_skills": [],
+        "skill_votes": {},
+        "low_confidence_skills": [],
+        "agreement_score": 0.0,
+        "rationale": "",
+        "validation_status": "skipped",
+        "validation_errors": [],
+        "skipped": True,
+        "skip_reason": concept.get("skip_reason") or _skip_reason_for_child(
+            {
+                "key": concept.get("child_component_key") or "",
+                "title": concept.get("child_component_title") or "",
+            }
+        ),
+        "child_component_key": concept.get("child_component_key", ""),
+        "child_component_type": concept.get("child_component_type", ""),
+        "child_component_title": concept.get("child_component_title", ""),
     }
 
 
@@ -1053,6 +1481,8 @@ def analyze_program(
     program_title = program.get("title") or program_key
     _progress("Extracting workspace concepts and starter files...")
     workspace_concepts = extract_workspace_concepts(program, jwt)
+    skipped_count = sum(1 for c in workspace_concepts if c.get("skipped"))
+    tagged_count = len(workspace_concepts) - skipped_count
 
     if not workspace_concepts:
         return {
@@ -1064,6 +1494,8 @@ def analyze_program(
                 "locale": program.get("_resolved_locale"),
                 "unreleased": program.get("_unreleased", False),
                 "workspace_concept_count": 0,
+                "tagged_concept_count": 0,
+                "skipped_child_concept_count": 0,
             },
             "workspace_concepts": [],
             "results": [],
@@ -1072,6 +1504,15 @@ def analyze_program(
     results: list[dict[str, Any]] = []
     total = len(workspace_concepts)
     for i, concept in enumerate(workspace_concepts, 1):
+        if concept.get("skipped"):
+            child_key = concept.get("child_component_key") or "child component"
+            _progress(
+                f"Skipping (in {child_key}): {concept.get('concept_title', '')}",
+                current=i,
+                total=total,
+            )
+            results.append(_skipped_tag_result(concept))
+            continue
         _progress(
             f"Tagging: {concept.get('concept_title', '')}",
             current=i,
@@ -1099,6 +1540,8 @@ def analyze_program(
             "locale": program.get("_resolved_locale"),
             "unreleased": program.get("_unreleased", False),
             "workspace_concept_count": len(workspace_concepts),
+            "tagged_concept_count": tagged_count,
+            "skipped_child_concept_count": skipped_count,
         },
         "workspace_concepts": workspace_concepts,
         "results": results,
