@@ -138,19 +138,26 @@ flowchart TD
 
     subgraph extract ["2. Build concept context"]
         SCAN["Find concepts with WorkspaceAtom"]
+        FILTER["Keep concepts owned by this component;\nskip nested child components\n(e.g. ls inside cd)"]
         ATOMS["Text, Video VTT, Quiz atoms"]
         WS["WorkspaceAtom metadata"]
         PROV["workspace-provisioner<br/>/masterfiles/download"]
         GCS["GCS udacity-masterfiles<br/>starter .tar.gz"]
+        SCOPE["Scope to main_default_path<br/>exercise folder + ancestor READMEs"]
         CTX["Concept context text"]
+        SKIP["Skip note: in child component"]
         CC --> SCAN
-        SCAN --> ATOMS
-        SCAN --> WS
+        SCAN --> FILTER
+        FILTER --> ATOMS
+        FILTER --> WS
+        FILTER --> SKIP
         ATOMS --> CTX
         WS --> PROV
         SECRETS --> PROV
         PROV --> GCS
-        GCS --> CTX
+        GCS --> SCOPE
+        WS --> SCOPE
+        SCOPE --> CTX
     end
 
     subgraph tag ["3. Recommend skills"]
@@ -170,6 +177,8 @@ flowchart TD
         CSV["Download CSV"]
         CONS --> UI
         CONS --> CSV
+        SKIP --> UI
+        SKIP --> CSV
     end
 """
 
@@ -287,7 +296,7 @@ def _render_mermaid_dark(diagram: str, *, height: int = 720) -> None:
 
 def _render_data_flow_expander() -> None:
     with st.expander("How it works", expanded=False):
-        _render_mermaid_dark(_DATA_FLOW_MERMAID)
+        _render_mermaid_dark(_DATA_FLOW_MERMAID, height=800)
 
 
 def _results_to_rows(results: list[dict[str, Any]], n_runs: int) -> list[dict[str, Any]]:
@@ -297,11 +306,16 @@ def _results_to_rows(results: list[dict[str, Any]], n_runs: int) -> list[dict[st
             "concept_title": r.get("concept_title", ""),
             "concept_key": r.get("concept_key", ""),
             "lesson_title": r.get("lesson_title", ""),
+            "skipped": "yes" if r.get("skipped") else "no",
+            "skip_reason": r.get("skip_reason", ""),
+            "child_component_key": r.get("child_component_key", ""),
             "consensus_skills": "; ".join(r.get("consensus_skills") or []),
             "agreement_score": r.get("agreement_score", 0),
             "validation_status": r.get("validation_status", ""),
             "workspace_files_extracted": "yes" if r.get("workspace_files_included") else "no",
             "workspace_files_chars": r.get("workspace_files_chars", 0),
+            "workspace_scope": r.get("workspace_scope_status", ""),
+            "workspace_scope_paths": "; ".join(r.get("workspace_scope_paths") or []),
             "llm_input_text": r.get("llm_input_text", ""),
         }
         run_skills = r.get("run_skills") or []
@@ -356,11 +370,25 @@ def _render_card(r: dict[str, Any], program_key: str) -> None:
         st.caption(ck)
         if program_key and ck:
             st.markdown(f"[Open in Classroom]({_classroom_url(program_key, ck)})")
+        if r.get("skipped"):
+            child_key = r.get("child_component_key") or ""
+            st.info(r.get("skip_reason") or "Skill tagging skipped because this concept is in a child component.")
+            if child_key:
+                st.caption(f"Tag this concept by analyzing `{child_key}` instead.")
+            return
         _render_skill_pills(r.get("consensus_skills") or [])
         if r.get("rationale"):
             st.markdown(f"**Rationale:** {r.get('rationale')}")
         if r.get("workspace_files_included"):
             st.caption("✅ starter files found")
+            scope_paths = r.get("workspace_scope_paths") or []
+            status = r.get("workspace_scope_status", "")
+            if scope_paths:
+                st.caption(f"📁 exercise folder: `{'; '.join(scope_paths)}`")
+            elif status == "unresolved":
+                st.caption("📁 default path did not match the archive — whole workspace used")
+            elif status == "full_workspace":
+                st.caption("📁 no per-concept default path — whole workspace used")
         else:
             st.caption("❌ starter files not found")
         if r.get("validation_errors"):
@@ -441,7 +469,9 @@ def _run_analyze(
 st.title("Concept Skill Tagger")
 st.markdown(
     "Enter a **cd** or **nd** key, find concepts with workspaces, and recommend "
-    "1–3 program-level skills per concept."
+    "1–3 program-level skills per concept. Only concepts **owned by this component** "
+    "are tagged; concepts in a nested child component (for example an **ls** lesson "
+    "library inside a **cd**) are listed with a skip note."
 )
 
 _render_data_flow_expander()
@@ -489,7 +519,15 @@ with st.sidebar:
         if meta.get("unreleased"):
             st.caption("Unreleased / construction branch")
         st.caption(f"Allowed skills: {len(meta.get('allowed_skills') or [])}")
-        st.caption(f"Workspace concepts: {meta.get('workspace_concept_count', 0)}")
+        tagged = meta.get("tagged_concept_count")
+        skipped = meta.get("skipped_child_concept_count", 0)
+        if tagged is None:
+            st.caption(f"Workspace concepts: {meta.get('workspace_concept_count', 0)}")
+        else:
+            st.caption(
+                f"Workspace concepts: {meta.get('workspace_concept_count', 0)} "
+                f"({tagged} tagged, {skipped} skipped — child component)"
+            )
 
 # ---- Results ----
 
@@ -526,7 +564,9 @@ _render_skill_pills(teaches_skills, label="Teaches skills:")
 
 st.markdown(
     "Skills in **consensus** appeared in a majority of LLM runs. "
-    "Low-confidence skills appeared in only one run."
+    "Low-confidence skills appeared in only one run. "
+    "Concepts in a nested child component are **not tagged** here — analyze that "
+    "child component's key to tag them."
 )
 
 if view_mode == "Table":
