@@ -417,6 +417,59 @@ def _skills_from_metadata(
     return names
 
 
+def _merge_skill_lists(*lists: list[str]) -> list[str]:
+    """Union skill names in order, deduping case-insensitively like _canonical_skill."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for names in lists:
+        for name in names or []:
+            lowered = name.lower()
+            if lowered not in seen:
+                seen.add(lowered)
+                merged.append(name)
+    return merged
+
+
+def _collect_child_components(
+    jwt: str,
+    release: dict[str, Any] | None,
+) -> tuple[dict[int, dict[str, str]], dict[str, dict[str, Any]]]:
+    """Walk the dependency graph transitively, at every depth.
+
+    A component only lists its *direct* dependencies, so a lesson library nested
+    inside a course inside a nanodegree is invisible one level down. Returns
+    (root_node_id -> child descriptor, component key -> metadata) for every nested
+    component, so each one still contributes its own teaches_skills.
+    """
+    by_root: dict[int, dict[str, str]] = {}
+    metadata: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
+    queue = list(_child_components_from_release(release).items())
+    while queue:
+        root_id, child = queue.pop(0)
+        key = (child.get("key") or "").strip()
+        if not key:
+            continue
+        by_root.setdefault(int(root_id), child)
+        if key in seen:
+            continue
+        seen.add(key)
+        # Resolving a child is best-effort: one unreadable component must not
+        # abort the whole analysis.
+        try:
+            _, locale, child_release = _resolve_root_node_id(jwt, key)
+            child_metadata = _metadata_from_release(child_release)
+            if not child_metadata:
+                construction = _construction_release(jwt, key, locale)
+                child_metadata = _metadata_from_release(construction) if construction else None
+        except UdacityAPIError:
+            continue
+        if child_metadata:
+            metadata[key] = child_metadata
+        queue.extend(_child_components_from_release(child_release).items())
+    return by_root, metadata
+
+
 def fetch_program_tree(jwt: str, root_node_id: int) -> dict[str, Any]:
     node = _gql(jwt, "NodeById", {"id": root_node_id}).get("node")
     if not node:
@@ -438,7 +491,9 @@ def resolve_program(jwt: str, program_key: str) -> dict[str, Any]:
     node["_metadata"] = metadata
     node["_unreleased"] = release.get("_unreleased", False)
     node["_branch_id"] = release.get("id") or node.get("branch_id")
-    node["_child_components"] = _child_components_from_release(release)
+    child_components, child_metadata = _collect_child_components(jwt, release)
+    node["_child_components"] = child_components
+    node["_child_metadata"] = child_metadata
     return node
 
 
@@ -957,18 +1012,6 @@ def _enclosing_child_component(
     }
 
 
-def _skip_reason_for_child(child: dict[str, str]) -> str:
-    key = child.get("key") or ""
-    title = child.get("title") or ""
-    if key and title:
-        label = f"{key} ({title})"
-    else:
-        label = key or title or "unknown"
-    return (
-        f"Skill tagging skipped because this concept is in child component {label}."
-    )
-
-
 def _workspace_concept_record(
     concept: dict[str, Any],
     lesson: dict[str, Any],
@@ -979,7 +1022,6 @@ def _workspace_concept_record(
     child: dict[str, str] | None = None,
     scope_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    skipped = child is not None
     scope = scope_info or {}
     return {
         "concept_key": concept.get("key") or "",
@@ -992,8 +1034,6 @@ def _workspace_concept_record(
         "workspace_scope_status": scope.get("workspace_scope_status", ""),
         "workspace_scope_paths": scope.get("workspace_scope_paths") or [],
         "workspace_default_paths": scope.get("workspace_default_paths") or [],
-        "skipped": skipped,
-        "skip_reason": _skip_reason_for_child(child) if child else "",
         "child_component_key": (child or {}).get("key") or "",
         "child_component_type": (child or {}).get("type") or "",
         "child_component_title": (child or {}).get("title") or "",
@@ -1020,11 +1060,6 @@ def _walk_lessons_for_workspace(
             concept_child = _enclosing_child_component(
                 concept, child, child_by_root_id, parent_branch_id
             )
-            if concept_child:
-                results.append(
-                    _workspace_concept_record(concept, lesson, child=concept_child)
-                )
-                continue
             context, files_included, files_chars, scope_info = _build_concept_context(
                 concept, jwt, masterfiles_cache
             )
@@ -1035,6 +1070,7 @@ def _walk_lessons_for_workspace(
                     context=context,
                     files_included=files_included,
                     files_chars=files_chars,
+                    child=concept_child,
                     scope_info=scope_info,
                 )
             )
@@ -1045,7 +1081,7 @@ def extract_workspace_concepts(
     program: dict[str, Any],
     jwt: str,
 ) -> list[dict[str, Any]]:
-    """Find workspace concepts owned by this component; skip nested child components."""
+    """Find every workspace concept, including those inside nested child components."""
     masterfiles_cache: dict[tuple[int, str, str], bytes] = {}
     concepts: list[dict[str, Any]] = []
     child_by_root_id = program.get("_child_components") or {}
@@ -1152,9 +1188,16 @@ def _build_user_prompt(
             "The workspace files below are only the exercise folder this concept opens "
             f"({'; '.join(scope_paths)}), not the whole workspace.\n"
         )
+    child_key = concept.get("child_component_key") or ""
+    child_title = concept.get("child_component_title") or ""
+    library_note = ""
+    if child_key or child_title:
+        label = f"{child_key} — {child_title}" if child_key and child_title else (child_key or child_title)
+        library_note = f"CONTAINING LIBRARY: {label}\n"
     return (
         f"PROGRAM: {program_key} — {program_title}\n"
         f"ALLOWED SKILLS (pick 1–3 exact names from this list only):\n{skill_lines}\n\n"
+        f"{library_note}"
         f"CONCEPT: {concept.get('concept_title', '')} (key: {concept.get('concept_key', '')})\n"
         "This concept includes a workspace activity. Tag skills the learner will practice, "
         "apply, or be meaningfully exposed to by engaging with the workspace and related "
@@ -1368,11 +1411,9 @@ def tag_concept(
             "rationale": outcome["rationale"],
             "validation_status": outcome["validation_status"],
             "validation_errors": outcome["validation_errors"],
-            "skipped": False,
-            "skip_reason": "",
-            "child_component_key": "",
-            "child_component_type": "",
-            "child_component_title": "",
+            "child_component_key": concept.get("child_component_key", ""),
+            "child_component_type": concept.get("child_component_type", ""),
+            "child_component_title": concept.get("child_component_title", ""),
         }
 
     # Single run
@@ -1402,42 +1443,6 @@ def tag_concept(
         "rationale": _normalize_rationale(parsed.rationale) if parsed else "",
         "validation_status": status,
         "validation_errors": [err] if err else [],
-        "skipped": False,
-        "skip_reason": "",
-        "child_component_key": "",
-        "child_component_type": "",
-        "child_component_title": "",
-    }
-
-
-def _skipped_tag_result(concept: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "concept_key": concept.get("concept_key", ""),
-        "concept_title": concept.get("concept_title", ""),
-        "lesson_key": concept.get("lesson_key", ""),
-        "lesson_title": concept.get("lesson_title", ""),
-        "context_text": "",
-        "llm_input_text": "",
-        "workspace_files_included": False,
-        "workspace_files_chars": 0,
-        "workspace_scope_status": "",
-        "workspace_scope_paths": [],
-        "workspace_default_paths": [],
-        "consensus_skills": [],
-        "run_skills": [],
-        "skill_votes": {},
-        "low_confidence_skills": [],
-        "agreement_score": 0.0,
-        "rationale": "",
-        "validation_status": "skipped",
-        "validation_errors": [],
-        "skipped": True,
-        "skip_reason": concept.get("skip_reason") or _skip_reason_for_child(
-            {
-                "key": concept.get("child_component_key") or "",
-                "title": concept.get("child_component_title") or "",
-            }
-        ),
         "child_component_key": concept.get("child_component_key", ""),
         "child_component_type": concept.get("child_component_type", ""),
         "child_component_title": concept.get("child_component_title", ""),
@@ -1468,21 +1473,29 @@ def analyze_program(
     _progress("Resolving program key...")
     program = resolve_program(jwt, program_key)
     metadata = program.get("_metadata")
-    teaches_skills = _skills_from_metadata(metadata, include_prerequisites=False)
-    allowed_skills = _skills_from_metadata(
-        metadata, include_prerequisites=include_prerequisites
+    child_metadata = program.get("_child_metadata") or {}
+    # Concepts inside a nested child library are tagged too, so that library's own
+    # teaches_skills join the allowlist.
+    teaches_skills = _merge_skill_lists(
+        _skills_from_metadata(metadata, include_prerequisites=False),
+        *(_skills_from_metadata(m, include_prerequisites=False) for m in child_metadata.values()),
+    )
+    allowed_skills = _merge_skill_lists(
+        _skills_from_metadata(metadata, include_prerequisites=include_prerequisites),
+        *(
+            _skills_from_metadata(m, include_prerequisites=include_prerequisites)
+            for m in child_metadata.values()
+        ),
     )
     if not allowed_skills:
         raise UdacityAPIError(
-            "No teaches_skills found in program metadata. "
+            "No teaches_skills found in program or child component metadata. "
             "The program may lack skill metadata or the JWT cannot read it."
         )
 
     program_title = program.get("title") or program_key
     _progress("Extracting workspace concepts and starter files...")
     workspace_concepts = extract_workspace_concepts(program, jwt)
-    skipped_count = sum(1 for c in workspace_concepts if c.get("skipped"))
-    tagged_count = len(workspace_concepts) - skipped_count
 
     if not workspace_concepts:
         return {
@@ -1493,9 +1506,8 @@ def analyze_program(
                 "allowed_skills": allowed_skills,
                 "locale": program.get("_resolved_locale"),
                 "unreleased": program.get("_unreleased", False),
+                "child_component_keys": sorted(child_metadata),
                 "workspace_concept_count": 0,
-                "tagged_concept_count": 0,
-                "skipped_child_concept_count": 0,
             },
             "workspace_concepts": [],
             "results": [],
@@ -1504,15 +1516,6 @@ def analyze_program(
     results: list[dict[str, Any]] = []
     total = len(workspace_concepts)
     for i, concept in enumerate(workspace_concepts, 1):
-        if concept.get("skipped"):
-            child_key = concept.get("child_component_key") or "child component"
-            _progress(
-                f"Skipping (in {child_key}): {concept.get('concept_title', '')}",
-                current=i,
-                total=total,
-            )
-            results.append(_skipped_tag_result(concept))
-            continue
         _progress(
             f"Tagging: {concept.get('concept_title', '')}",
             current=i,
@@ -1539,9 +1542,8 @@ def analyze_program(
             "allowed_skills": allowed_skills,
             "locale": program.get("_resolved_locale"),
             "unreleased": program.get("_unreleased", False),
+            "child_component_keys": sorted(child_metadata),
             "workspace_concept_count": len(workspace_concepts),
-            "tagged_concept_count": tagged_count,
-            "skipped_child_concept_count": skipped_count,
         },
         "workspace_concepts": workspace_concepts,
         "results": results,
