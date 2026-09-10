@@ -447,19 +447,23 @@ def _collect_child_components(
     queue = list(_child_components_from_release(release).items())
     while queue:
         root_id, child = queue.pop(0)
-        by_root.setdefault(int(root_id), child)
         key = (child.get("key") or "").strip()
-        if not key or key in seen:
+        if not key:
+            continue
+        by_root.setdefault(int(root_id), child)
+        if key in seen:
             continue
         seen.add(key)
+        # Resolving a child is best-effort: one unreadable component must not
+        # abort the whole analysis.
         try:
             _, locale, child_release = _resolve_root_node_id(jwt, key)
+            child_metadata = _metadata_from_release(child_release)
+            if not child_metadata:
+                construction = _construction_release(jwt, key, locale)
+                child_metadata = _metadata_from_release(construction) if construction else None
         except UdacityAPIError:
             continue
-        child_metadata = _metadata_from_release(child_release)
-        if not child_metadata:
-            construction = _construction_release(jwt, key, locale)
-            child_metadata = _metadata_from_release(construction) if construction else None
         if child_metadata:
             metadata[key] = child_metadata
         queue.extend(_child_components_from_release(child_release).items())
