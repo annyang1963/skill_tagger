@@ -161,7 +161,7 @@ flowchart TD
 
     subgraph tag ["3. Recommend skills"]
         PROMPT["Prompt: allowlist + context<br/>learner practice / exposure"]
-        LLM["OpenAI structured output<br/>1-3 skills + rationale"]
+        LLM["OpenAI structured output<br/>1 skill demonstrated<br/>+ 0-2 adjacent touched"]
         VALID["Validate names against allowlist"]
         CONS["Consensus majority vote<br/>optional N runs"]
         META --> PROMPT
@@ -305,6 +305,8 @@ def _results_to_rows(results: list[dict[str, Any]], n_runs: int) -> list[dict[st
             "lesson_title": r.get("lesson_title", ""),
             "child_component_key": r.get("child_component_key", ""),
             "child_component_title": r.get("child_component_title", ""),
+            "primary_skill": r.get("primary_skill", ""),
+            "secondary_skills": "; ".join(r.get("secondary_skills") or []),
             "consensus_skills": "; ".join(r.get("consensus_skills") or []),
             "agreement_score": r.get("agreement_score", 0),
             "validation_status": r.get("validation_status", ""),
@@ -348,14 +350,16 @@ def _display_n_runs(results: list[dict[str, Any]], settings: dict[str, Any]) -> 
     return max(1, from_runs)
 
 
-def _render_skill_pills(skills: list[str], *, label: str = "Skills:") -> None:
+def _render_skill_pills(
+    skills: list[str], *, label: str = "Skills:", color: str = "blue"
+) -> None:
     st.markdown(f"**{label}**")
     if not skills:
         st.caption("—")
         return
     with st.container(horizontal=True, gap="small", horizontal_alignment="left"):
         for skill in skills:
-            st.badge(skill, color="blue")
+            st.badge(skill, color=color)
 
 
 def _render_card(r: dict[str, Any], program_key: str) -> None:
@@ -371,7 +375,15 @@ def _render_card(r: dict[str, Any], program_key: str) -> None:
         if child_key or child_title:
             label = f"{child_key} — {child_title}" if child_key and child_title else (child_key or child_title)
             st.caption(f"📚 in child library `{label}`")
-        _render_skill_pills(r.get("consensus_skills") or [])
+        _render_skill_pills(
+            [r["primary_skill"]] if r.get("primary_skill") else [],
+            label="Primary skill demonstrated:",
+        )
+        _render_skill_pills(
+            r.get("secondary_skills") or [],
+            label="Adjacent skills touched:",
+            color="gray",
+        )
         if r.get("rationale"):
             st.markdown(f"**Rationale:** {r.get('rationale')}")
         if r.get("workspace_files_included"):
@@ -464,8 +476,10 @@ def _run_analyze(
 st.title("Concept Skill Tagger")
 st.markdown(
     "Enter a **cd** or **nd** key, find concepts with workspaces, and recommend "
-    "1–3 program-level skills per concept. Concepts in a nested child library (for "
-    "example an **ls** lesson library inside a **cd**) are tagged too, and that "
+    "the one program-level skill each concept **demonstrates**, plus up to 2 "
+    "adjacent skills it only **touches**. "
+    "Concepts in a nested child library (for example an **ls** lesson library "
+    "inside a **cd**) are tagged too, and that "
     "library's own teaches_skills are added to the allowlist."
 )
 
@@ -554,8 +568,11 @@ teaches_skills = (meta or {}).get("teaches_skills") or []
 _render_skill_pills(teaches_skills, label="Teaches skills:")
 
 st.markdown(
-    "Skills in **consensus** appeared in a majority of LLM runs. "
-    "Low-confidence skills appeared in only one run. "
+    "The **primary skill** is the one the learner demonstrates — the skill their "
+    "workspace work is evidence of. **Adjacent skills** are only touched: used "
+    "incidentally or encountered, not demonstrated. Primary is decided by which "
+    "skill most runs named as primary; adjacent skills are those a majority agreed on. "
+    "Low-confidence skills fell short of that majority. "
     "Concepts inside a nested child library are tagged too, and that library's own "
     "teaches_skills are added to the allowlist above."
 )
