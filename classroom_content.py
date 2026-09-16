@@ -8,6 +8,7 @@ import re
 import tarfile
 import urllib.parse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -24,6 +25,8 @@ DEFAULT_MODEL = "gpt-4o-mini"
 VTT_MAX_CHARS = 2000
 RATIONALE_MAX_LENGTH = 255
 WORKSPACE_FILES_MAX_CHARS = 20000
+# Concepts tagged concurrently. Each worker issues one OpenAI request at a time.
+TAG_MAX_WORKERS = 8
 WORKSPACE_FILE_MAX_BYTES = 100_000
 TEXT_EXTENSIONS = frozenset({
     ".py", ".ipynb", ".md", ".txt", ".json", ".html", ".css", ".js",
@@ -240,10 +243,18 @@ class UdacityAPIError(RuntimeError):
 
 
 class SkillRecommendation(BaseModel):
-    recommended_skills: list[str] = Field(
+    primary_skill: str = Field(
         description=(
-            "1 to 3 skill names from the allowed list that the learner will practice, "
-            "apply, or be meaningfully exposed to by completing this concept"
+            "The single skill name from the allowed list that the learner actually "
+            "DEMONSTRATES in this concept — the skill their work in the workspace "
+            "is evidence of performing"
+        )
+    )
+    secondary_skills: list[str] = Field(
+        description=(
+            "0 to 2 adjacent skill names from the allowed list that the concept only "
+            "TOUCHES — used incidentally, encountered, or exposed to, without the "
+            "learner demonstrating them. Empty when nothing adjacent is touched."
         )
     )
     rationale: str = Field(
@@ -500,7 +511,7 @@ def resolve_program(jwt: str, program_key: str) -> dict[str, Any]:
 def _clean(text: str | None) -> str:
     if not text:
         return ""
-    return " ".join(str(text).split())
+    return _strip_surrogates(" ".join(str(text).split()))
 
 
 def _fetch_vtt_text(url: str) -> str:
@@ -576,12 +587,25 @@ def _extract_text_from_ipynb(data: bytes) -> str:
     return "\n".join(parts)
 
 
+def _strip_surrogates(text: str) -> str:
+    """Replace lone surrogates so the text can be encoded for an API request.
+
+    A notebook's JSON can legitimately carry an unpaired surrogate (e.g. "\\udcb0"
+    from a mis-encoded latin-1 byte). json.loads yields it happily and str holds
+    it, but encoding the OpenAI request body then raises UnicodeEncodeError and
+    fails the whole concept.
+    """
+    if not text:
+        return text
+    return text.encode("utf-8", "replace").decode("utf-8", "replace")
+
+
 def _archive_member_text(path: str, data: bytes) -> str:
     suffix = PurePosixPath(path).suffix.lower()
     if suffix == ".ipynb":
-        return _extract_text_from_ipynb(data)
+        return _strip_surrogates(_extract_text_from_ipynb(data))
     try:
-        return data.decode("utf-8", errors="replace")
+        return _strip_surrogates(data.decode("utf-8", errors="replace"))
     except Exception:
         return ""
 
@@ -1155,7 +1179,7 @@ def validate_skills(
 ) -> tuple[list[str], str | None]:
     """Return (canonical_skills, error_message). error_message is None on success."""
     if not isinstance(skills, list):
-        return [], "recommended_skills is not a list"
+        return [], "skill list is not a list"
     canonical: list[str] = []
     seen: set[str] = set()
     for raw in skills:
@@ -1172,6 +1196,36 @@ def validate_skills(
     if len(canonical) > max_count:
         canonical = canonical[:max_count]
     return canonical, None
+
+
+MAX_SECONDARY_SKILLS = 2
+
+
+def validate_recommendation(
+    parsed: SkillRecommendation,
+    allowed: list[str],
+) -> tuple[str, list[str], str | None]:
+    """Return (primary, secondaries, error). error is None on success.
+
+    Secondaries are capped at MAX_SECONDARY_SKILLS and never repeat the primary.
+    """
+    raw_primary = parsed.primary_skill if isinstance(parsed.primary_skill, str) else ""
+    primary = _canonical_skill(raw_primary.strip(), allowed) if raw_primary.strip() else None
+    if not primary:
+        if not raw_primary.strip():
+            return "", [], "no primary_skill returned"
+        return "", [], f"skill not in program allowlist: {raw_primary!r}"
+
+    secondaries, err = validate_skills(
+        parsed.secondary_skills,
+        allowed,
+        min_count=0,
+        max_count=MAX_SECONDARY_SKILLS + 1,
+    )
+    if err:
+        return "", [], err
+    secondaries = [s for s in secondaries if s != primary][:MAX_SECONDARY_SKILLS]
+    return primary, secondaries, None
 
 
 def _build_user_prompt(
@@ -1196,7 +1250,7 @@ def _build_user_prompt(
         library_note = f"CONTAINING LIBRARY: {label}\n"
     return (
         f"PROGRAM: {program_key} — {program_title}\n"
-        f"ALLOWED SKILLS (pick 1–3 exact names from this list only):\n{skill_lines}\n\n"
+        f"ALLOWED SKILLS (use exact names from this list only):\n{skill_lines}\n\n"
         f"{library_note}"
         f"CONCEPT: {concept.get('concept_title', '')} (key: {concept.get('concept_key', '')})\n"
         "This concept includes a workspace activity. Tag skills the learner will practice, "
@@ -1217,22 +1271,31 @@ def _normalize_rationale(text: str) -> str:
 SYSTEM_PROMPT = """You are a Udacity curriculum skills tagger for concepts that include a \
 hands-on workspace activity.
 
-Pick 1–3 skills from the ALLOWED SKILLS list that a learner will practice, apply, or be \
-meaningfully exposed to if they complete the concept—especially by working through the \
-workspace starter files, instructions, and supporting atoms (text, video, quizzes).
+Separate what the learner DEMONSTRATES from what the concept merely TOUCHES, drawing \
+every name from the ALLOWED SKILLS list. Judge this from what the learner actually does \
+in the workspace starter files and instructions, supported by the other atoms (text, \
+video, quizzes).
 
-Ask: "What skill(s) will this learner have demonstrated—or at least engaged with—after \
-finishing this concept?"
+primary_skill — the ONE skill the learner demonstrates. Ask: "If I had to point at this \
+concept as evidence the learner can do something, what is that one thing?" It is the \
+skill their own work in the workspace performs and would be assessed on. Exactly one, \
+never empty.
+
+secondary_skills — 0 to 2 ADJACENT skills the concept only touches: used incidentally, \
+encountered in passing, provided already-written in the starter code, or read about \
+without being practiced. The learner does NOT demonstrate these; they are neighbours of \
+the primary skill, not runners-up for it.
 
 Rules:
 - Copy skill names EXACTLY from the allowed list (same spelling and casing).
-- Return 1 to 3 skills only.
-- Tie choices to what the learner does or tries in the workspace (write code, debug, \
-configure, analyze data, etc.), not tangential topics only mentioned in passing.
-- Prefer demonstrated practice over passive exposure when both fit; if content is thin, \
-pick the best-matching exposure-level skills from the list.
-- rationale: max 255 characters; one short sentence; always call the analyzed item \
-"concept" — never "lesson" or "course".
+- Never repeat the primary skill in secondary_skills.
+- Leave secondary_skills empty when the concept touches nothing adjacent. Do not pad it \
+to reach two, and do not demote a second genuinely demonstrated skill into it — pick the \
+dominant one as primary and only list truly adjacent skills as secondary.
+- Ignore topics merely name-dropped with no bearing on the learner's work.
+- rationale: max 255 characters; one short sentence saying what the learner demonstrates \
+and why that is the primary skill; always call the analyzed item "concept" — never \
+"lesson" or "course".
 """
 
 STRICT_SYSTEM_PROMPT = SYSTEM_PROMPT + "\nIMPORTANT: You previously returned invalid skill names. \
@@ -1251,8 +1314,12 @@ def recommend_skills(
     model: str = DEFAULT_MODEL,
     temperature: float = 0.7,
     strict: bool = False,
-) -> tuple[SkillRecommendation | None, list[str], str | None]:
-    """Call OpenAI once. Returns (parsed, validated_skills, validation_error)."""
+) -> tuple[SkillRecommendation | None, tuple[str, list[str]], str | None]:
+    """Call OpenAI once.
+
+    Returns (parsed, (primary, secondaries), validation_error). On failure the
+    skills tuple is ("", []).
+    """
     client = _openai_client(api_key)
     system = STRICT_SYSTEM_PROMPT if strict else SYSTEM_PROMPT
     try:
@@ -1267,13 +1334,13 @@ def recommend_skills(
         )
         parsed = resp.choices[0].message.parsed
         if parsed is None:
-            return None, [], "LLM returned no parsed response"
-        validated, err = validate_skills(parsed.recommended_skills, allowed_skills)
+            return None, ("", []), "LLM returned no parsed response"
+        primary, secondaries, err = validate_recommendation(parsed, allowed_skills)
         if err:
-            return parsed, [], err
-        return parsed, validated, None
+            return parsed, ("", []), err
+        return parsed, (primary, secondaries), None
     except Exception as e:
-        return None, [], f"OpenAI error: {e}"
+        return None, ("", []), f"OpenAI error: {e}"
 
 
 def run_with_consensus(
@@ -1287,6 +1354,7 @@ def run_with_consensus(
 ) -> dict[str, Any]:
     """Run N LLM calls and compute majority-vote consensus."""
     run_skills: list[list[str]] = []
+    run_primaries: list[str] = []
     run_rationales: list[str] = []
     validation_errors: list[str] = []
 
@@ -1308,17 +1376,14 @@ def run_with_consensus(
                 temperature=temperature,
                 strict=True,
             )
+        primary, secondaries = ("", []) if err else skills
+        run_primaries.append(primary)
+        run_skills.append([] if err else [primary, *secondaries])
         if err:
             validation_errors.append(f"run {i + 1}: {err}")
-            run_skills.append([])
-            run_rationales.append(
-                _normalize_rationale(parsed.rationale) if parsed else ""
-            )
-        else:
-            run_skills.append(skills)
-            run_rationales.append(
-                _normalize_rationale(parsed.rationale) if parsed else ""
-            )
+        run_rationales.append(
+            _normalize_rationale(parsed.rationale) if parsed else ""
+        )
 
     threshold = math.ceil(n_runs / 2)
     vote_counter: Counter[str] = Counter()
@@ -1326,12 +1391,31 @@ def run_with_consensus(
         for s in skills:
             vote_counter[s] += 1
 
-    consensus = [s for s, count in vote_counter.items() if count >= threshold]
+    # The primary is decided by its own vote across runs, not by total mentions: a
+    # skill every run lists as merely supporting must not outrank the primary pick.
+    primary_counter = Counter(p for p in run_primaries if p)
+    consensus_primary = ""
+    if primary_counter:
+        top = max(primary_counter.values())
+        tied = [s for s, c in primary_counter.items() if c == top]
+        consensus_primary = min(
+            tied, key=lambda s: (-vote_counter[s], allowed_skills.index(s))
+        )
+
     # Preserve allowlist order for stable output.
-    consensus_ordered = [s for s in allowed_skills if s in consensus]
+    consensus_secondary = [
+        s
+        for s in allowed_skills
+        if s != consensus_primary and vote_counter.get(s, 0) >= threshold
+    ][:MAX_SECONDARY_SKILLS]
+    consensus_ordered = (
+        [consensus_primary, *consensus_secondary] if consensus_primary else []
+    )
 
     low_confidence = [
-        s for s, count in vote_counter.items() if count < threshold and count > 0
+        s
+        for s, count in vote_counter.items()
+        if count > 0 and s not in consensus_ordered
     ]
 
     agreement_scores: list[float] = []
@@ -1360,8 +1444,11 @@ def run_with_consensus(
         status = "partial"
 
     return {
+        "primary_skill": consensus_primary,
+        "secondary_skills": consensus_secondary,
         "consensus_skills": consensus_ordered,
         "run_skills": run_skills,
+        "run_primaries": run_primaries,
         "skill_votes": skill_votes,
         "low_confidence_skills": low_confidence,
         "agreement_score": round(agreement_score, 3),
@@ -1403,8 +1490,11 @@ def tag_concept(
             "workspace_scope_status": concept.get("workspace_scope_status", ""),
             "workspace_scope_paths": concept.get("workspace_scope_paths") or [],
             "workspace_default_paths": concept.get("workspace_default_paths") or [],
+            "primary_skill": outcome["primary_skill"],
+            "secondary_skills": outcome["secondary_skills"],
             "consensus_skills": outcome["consensus_skills"],
             "run_skills": outcome["run_skills"],
+            "run_primaries": outcome["run_primaries"],
             "skill_votes": outcome["skill_votes"],
             "low_confidence_skills": outcome["low_confidence_skills"],
             "agreement_score": outcome["agreement_score"],
@@ -1423,6 +1513,8 @@ def tag_concept(
             api_key, user_prompt, allowed_skills, model=model, strict=True
         )
     status = "ok" if not err else "error"
+    primary, secondaries = skills
+    ordered = [primary, *secondaries] if primary else []
     return {
         "concept_key": concept.get("concept_key", ""),
         "concept_title": concept.get("concept_title", ""),
@@ -1435,11 +1527,14 @@ def tag_concept(
         "workspace_scope_status": concept.get("workspace_scope_status", ""),
         "workspace_scope_paths": concept.get("workspace_scope_paths") or [],
         "workspace_default_paths": concept.get("workspace_default_paths") or [],
-        "consensus_skills": skills,
-        "run_skills": [skills] if skills else [],
-        "skill_votes": {s: 1 for s in skills},
+        "primary_skill": primary,
+        "secondary_skills": secondaries,
+        "consensus_skills": ordered,
+        "run_skills": [ordered] if ordered else [],
+        "run_primaries": [primary] if primary else [],
+        "skill_votes": {s: 1 for s in ordered},
         "low_confidence_skills": [],
-        "agreement_score": 1.0 if skills else 0.0,
+        "agreement_score": 1.0 if ordered else 0.0,
         "rationale": _normalize_rationale(parsed.rationale) if parsed else "",
         "validation_status": status,
         "validation_errors": [err] if err else [],
@@ -1513,16 +1608,15 @@ def analyze_program(
             "results": [],
         }
 
-    results: list[dict[str, Any]] = []
     total = len(workspace_concepts)
-    for i, concept in enumerate(workspace_concepts, 1):
-        _progress(
-            f"Tagging: {concept.get('concept_title', '')}",
-            current=i,
-            total=total,
-        )
-        results.append(
-            tag_concept(
+    results: list[dict[str, Any] | None] = [None] * total
+    # A nanodegree can hold 100+ workspace concepts; tagged one at a time that is
+    # tens of minutes of round-trips, so fan them out. Results stay in concept order.
+    workers = max(1, min(TAG_MAX_WORKERS, total))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(
+                tag_concept,
                 openai_api_key,
                 program_key,
                 program_title,
@@ -1531,8 +1625,17 @@ def analyze_program(
                 consensus_enabled=consensus_enabled,
                 n_runs=n_runs,
                 model=model,
+            ): i
+            for i, concept in enumerate(workspace_concepts)
+        }
+        for done, future in enumerate(as_completed(futures), 1):
+            i = futures[future]
+            results[i] = future.result()
+            _progress(
+                f"Tagged {done}/{total}: {workspace_concepts[i].get('concept_title', '')}",
+                current=done,
+                total=total,
             )
-        )
 
     return {
         "program_meta": {
