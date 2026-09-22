@@ -17,22 +17,38 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 CLASSROOM_CONTENT_GRAPHQL = "https://api.udacity.com/api/classroom-content/v1/graphql"
+TAXONOMY_GRAPHQL = "https://api.udacity.com/api/taxonomy/v1/graphql"
+# Attribute holding a skill's authored definition on its taxonomy topic.
+SKILL_DEFINITION_ATTRIBUTE = "publishing:Definition"
+SKILL_DEFINITION_MAX_CHARS = 400
+# Definitions are fetched one topic per request, so fan them out.
+TAXONOMY_MAX_WORKERS = 8
 WORKSPACE_PROVISIONER_BASE = "https://api.udacity.com/api/workspace-provisioner"
 DEFAULT_LOCALE = "en-us"
 _TIMEOUT = 60
 ND_KEY_PATTERN = re.compile(r"^nd", re.IGNORECASE)
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "gpt-4o"
 VTT_MAX_CHARS = 2000
 RATIONALE_MAX_LENGTH = 255
 WORKSPACE_FILES_MAX_CHARS = 20000
 # Concepts tagged concurrently. Each worker issues one OpenAI request at a time.
 TAG_MAX_WORKERS = 8
+# A scoped allowlist below this size would dictate the answer rather than let the
+# model recommend one, so such a scope is discarded in favour of the wider list.
+MIN_ALLOWLIST_SKILLS = 2
 WORKSPACE_FILE_MAX_BYTES = 100_000
 TEXT_EXTENSIONS = frozenset({
     ".py", ".ipynb", ".md", ".txt", ".json", ".html", ".css", ".js",
     ".sh", ".yaml", ".yml", ".sql", ".r", ".xml", ".toml", ".ini", ".cfg",
 })
 SKIP_ARCHIVE_DIRS = frozenset({"node_modules", ".git", "__pycache__", ".venv", "venv"})
+# Filler words dropped before comparing skill names or ranking workspace paths.
+TOKEN_STOPWORDS = frozenset({
+    "a", "an", "and", "or", "the", "for", "in", "of", "to", "with", "on", "at", "by",
+    "from", "into", "as", "your", "their", "its", "intro", "introduction", "lesson",
+    "concept", "exercise", "part", "src", "main", "demo", "example", "examples",
+    "starter", "solution", "solutions", "code", "file", "files", "new", "final",
+})
 # Query params of a workspace launch URL that name the file/folder opened for the learner.
 DEFAULT_PATH_QUERY_KEYS = ("folder", "file", "path")
 # Query params holding a JSON launch config rather than a path.
@@ -243,6 +259,23 @@ class UdacityAPIError(RuntimeError):
 
 
 class SkillRecommendation(BaseModel):
+    # Structured output is generated field by field in declaration order, so these two
+    # analysis fields come first: they make the model characterise the work before it
+    # commits to a name, instead of justifying a name it already picked.
+    concept_technique: str = Field(
+        description=(
+            "One sentence naming the technique, pattern, or workflow the learner builds "
+            "in this concept, in the concept's own vocabulary. Do not mention any skill "
+            "name from the allowed list here."
+        )
+    )
+    capability_gained: str = Field(
+        description=(
+            "One sentence restating that technique as the general, transferable "
+            "capability it gives the learner, independent of this concept's subject "
+            "matter and wording. This is what must be matched against the allowed list."
+        )
+    )
     primary_skill: str = Field(
         description=(
             "The single skill name from the allowed list that the learner actually "
@@ -297,6 +330,67 @@ def _gql(jwt: str, operation: str, variables: dict[str, Any]) -> dict[str, Any]:
     return body.get("data") or {}
 
 
+TAXONOMY_TOPIC_QUERY = """query TopicByUri($uri: String!) {
+  topic(uri: $uri) {
+    displayName
+    attributes { typeUri value }
+  }
+}"""
+
+
+def _skill_definition(jwt: str, uri: str) -> str:
+    """Fetch one skill's authored definition from the taxonomy service.
+
+    Best-effort: the tagger still works on names alone, so a topic that is missing,
+    unreadable, or undefined simply contributes nothing.
+    """
+    try:
+        resp = requests.post(
+            TAXONOMY_GRAPHQL,
+            headers=_auth_headers(jwt),
+            json={
+                "query": TAXONOMY_TOPIC_QUERY,
+                "operationName": "TopicByUri",
+                "variables": {"uri": uri},
+            },
+            timeout=_TIMEOUT,
+        )
+        if not resp.ok:
+            return ""
+        topic = ((resp.json().get("data") or {}).get("topic")) or {}
+    except Exception:
+        return ""
+    for attribute in topic.get("attributes") or []:
+        if (attribute or {}).get("typeUri") == SKILL_DEFINITION_ATTRIBUTE:
+            text = _clean(attribute.get("value"))
+            if len(text) > SKILL_DEFINITION_MAX_CHARS:
+                return text[:SKILL_DEFINITION_MAX_CHARS].rstrip() + "..."
+            return text
+    return ""
+
+
+def fetch_skill_definitions(jwt: str, skills: list[dict[str, str]]) -> dict[str, str]:
+    """Map skill name -> definition for every skill that has one."""
+    targets = {
+        (s.get("name") or "").strip(): (s.get("uri") or "").strip()
+        for s in skills
+        if (s.get("name") or "").strip() and (s.get("uri") or "").strip()
+    }
+    if not targets:
+        return {}
+    definitions: dict[str, str] = {}
+    workers = max(1, min(TAXONOMY_MAX_WORKERS, len(targets)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_skill_definition, jwt, uri): name for name, uri in targets.items()
+        }
+        for future in as_completed(futures):
+            text = future.result()
+            if text:
+                definitions[futures[future]] = text
+    return definitions
+
+
 def _components_by_key(jwt: str, key: str) -> list[dict[str, Any]]:
     return _gql(jwt, "ComponentsByKey", {"key": key}).get("components") or []
 
@@ -348,7 +442,7 @@ def _pick_released_locale(components: list[dict[str, Any]]) -> str | None:
     if not components:
         return None
     has_release = lambda c: bool((c.get("latest_release") or {}).get("root_node_id"))
-    pool = [c for c in components if has_release()] or components
+    pool = [c for c in components if has_release(c)] or components
     chosen = (
         next((c for c in pool if c.get("locale") == DEFAULT_LOCALE), None)
         or next((c for c in pool if not c.get("deprecated")), None)
@@ -428,6 +522,28 @@ def _skills_from_metadata(
     return names
 
 
+def _skill_entries_from_metadata(
+    metadata: dict[str, Any] | None,
+    *,
+    include_prerequisites: bool = False,
+) -> list[dict[str, str]]:
+    """Skill {name, uri} pairs, so definitions can be looked up in the taxonomy."""
+    if not metadata:
+        return []
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for field in ("teaches_skills", "prerequisite_skills" if include_prerequisites else None):
+        if not field:
+            continue
+        for skill in metadata.get(field) or []:
+            name = (skill or {}).get("name")
+            uri = (skill or {}).get("uri")
+            if name and uri and name not in seen:
+                seen.add(name)
+                entries.append({"name": name, "uri": uri})
+    return entries
+
+
 def _merge_skill_lists(*lists: list[str]) -> list[str]:
     """Union skill names in order, deduping case-insensitively like _canonical_skill."""
     merged: list[str] = []
@@ -444,24 +560,33 @@ def _merge_skill_lists(*lists: list[str]) -> list[str]:
 def _collect_child_components(
     jwt: str,
     release: dict[str, Any] | None,
-) -> tuple[dict[int, dict[str, str]], dict[str, dict[str, Any]]]:
+) -> tuple[dict[int, dict[str, str]], dict[str, dict[str, Any]], dict[str, str]]:
     """Walk the dependency graph transitively, at every depth.
 
     A component only lists its *direct* dependencies, so a lesson library nested
     inside a course inside a nanodegree is invisible one level down. Returns
-    (root_node_id -> child descriptor, component key -> metadata) for every nested
-    component, so each one still contributes its own teaches_skills.
+    (root_node_id -> child descriptor, component key -> metadata, component key ->
+    containing course key). The last one lets a nested lesson library's skills be
+    credited to the course that owns it, which matters when a course declares no
+    skills of its own but its lessons do.
     """
     by_root: dict[int, dict[str, str]] = {}
     metadata: dict[str, dict[str, Any]] = {}
+    course_of: dict[str, str] = {}
     seen: set[str] = set()
-    queue = list(_child_components_from_release(release).items())
+    queue = [
+        (root_id, child, "") for root_id, child in _child_components_from_release(release).items()
+    ]
     while queue:
-        root_id, child = queue.pop(0)
+        root_id, child, parent_course = queue.pop(0)
         key = (child.get("key") or "").strip()
         if not key:
             continue
         by_root.setdefault(int(root_id), child)
+        # A course owns itself; anything below it inherits it.
+        course_key = key if _is_course_component(child) else parent_course
+        if course_key:
+            course_of.setdefault(key, course_key)
         if key in seen:
             continue
         seen.add(key)
@@ -477,8 +602,11 @@ def _collect_child_components(
             continue
         if child_metadata:
             metadata[key] = child_metadata
-        queue.extend(_child_components_from_release(child_release).items())
-    return by_root, metadata
+        queue.extend(
+            (rid, grandchild, course_key)
+            for rid, grandchild in _child_components_from_release(child_release).items()
+        )
+    return by_root, metadata, course_of
 
 
 def fetch_program_tree(jwt: str, root_node_id: int) -> dict[str, Any]:
@@ -502,9 +630,10 @@ def resolve_program(jwt: str, program_key: str) -> dict[str, Any]:
     node["_metadata"] = metadata
     node["_unreleased"] = release.get("_unreleased", False)
     node["_branch_id"] = release.get("id") or node.get("branch_id")
-    child_components, child_metadata = _collect_child_components(jwt, release)
+    child_components, child_metadata, course_of = _collect_child_components(jwt, release)
     node["_child_components"] = child_components
     node["_child_metadata"] = child_metadata
+    node["_course_of_component"] = course_of
     return node
 
 
@@ -512,6 +641,22 @@ def _clean(text: str | None) -> str:
     if not text:
         return ""
     return _strip_surrogates(" ".join(str(text).split()))
+
+
+def _stem(token: str) -> str:
+    """Crude singularisation so "Agent" and "Agents" compare as the same word."""
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _significant_tokens(text: str) -> frozenset[str]:
+    """Lowercase content-word stems, dropping filler that carries no topical meaning."""
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return frozenset(
+        _stem(t) for t in tokens if len(t) > 1 and t not in TOKEN_STOPWORDS
+    )
+
 
 
 def _fetch_vtt_text(url: str) -> str:
@@ -721,10 +866,18 @@ def _ancestor_doc_paths(names: set[str], roots: list[str]) -> set[str]:
     return docs
 
 
+def _path_relevance(name: str, terms: frozenset[str]) -> int:
+    """How many distinguishing terms the archive path itself mentions."""
+    if not terms:
+        return 0
+    return len(terms & _significant_tokens(name.replace("/", " ")))
+
+
 def _extract_text_from_archive(
     data: bytes,
     *,
     scope_target: str | None = None,
+    relevance_terms: str = "",
     max_chars: int = WORKSPACE_FILES_MAX_CHARS,
 ) -> tuple[str, dict[str, Any]]:
     """Extract readable text from a masterfiles tar.gz archive.
@@ -759,8 +912,14 @@ def _extract_text_from_archive(
                 if roots and not (_is_within_scope(name, roots) or name in docs):
                     continue
                 selected.append((name, member))
-            # In-scope files first so truncation never drops the exercise for a README.
-            selected.sort(key=lambda item: (item[0] in docs, item[0]))
+            if roots:
+                # In-scope files first so truncation never drops the exercise for a README.
+                selected.sort(key=lambda item: (item[0] in docs, item[0]))
+            else:
+                # Unscoped: the archive belongs to the whole lesson/course, so keep the
+                # files whose paths echo this concept rather than the alphabetical head.
+                terms = _significant_tokens(relevance_terms)
+                selected.sort(key=lambda item: (-_path_relevance(item[0], terms), item[0]))
 
             for name, member in selected:
                 if _should_skip_archive_path(name):
@@ -794,6 +953,8 @@ def _workspace_files_for_atom(
     atom: dict[str, Any],
     jwt: str,
     cache: dict[tuple[int, str, str], bytes],
+    *,
+    relevance_terms: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """Return (text, scope info) for this atom's slice of the workspace masterfiles.
 
@@ -823,7 +984,9 @@ def _workspace_files_for_atom(
         return "", empty_info
 
     scope_target = _default_path_target(atom.get("main_default_path"))
-    return _extract_text_from_archive(archive_bytes, scope_target=scope_target)
+    return _extract_text_from_archive(
+        archive_bytes, scope_target=scope_target, relevance_terms=relevance_terms
+    )
 
 
 def _is_workspace_atom(atom: dict[str, Any]) -> bool:
@@ -832,12 +995,7 @@ def _is_workspace_atom(atom: dict[str, Any]) -> bool:
     return typ == "workspaceatom" or semantic in ("workspaceatom", "workspace")
 
 
-def _atom_text(
-    atom: dict[str, Any],
-    *,
-    workspace_files_text: str = "",
-    workspace_scope: dict[str, Any] | None = None,
-) -> str:
+def _atom_text(atom: dict[str, Any]) -> str:
     semantic = atom.get("semantic_type") or atom.get("__typename") or ""
     title = atom.get("title") or ""
     parts: list[str] = []
@@ -864,16 +1022,6 @@ def _atom_text(
                 parts.append(f"configuration: {json.dumps(config, ensure_ascii=False)[:2000]}")
             except (TypeError, ValueError):
                 parts.append(f"configuration: {str(config)[:2000]}")
-        if workspace_files_text:
-            scope_paths = (workspace_scope or {}).get("scope_paths") or []
-            if scope_paths:
-                label = (
-                    "[WorkspaceAtom files — exercise folder for this concept: "
-                    f"{'; '.join(scope_paths)}]"
-                )
-            else:
-                label = "[WorkspaceAtom files]"
-            parts.append(f"{label} {workspace_files_text}")
 
     question = atom.get("question")
     if isinstance(question, dict):
@@ -927,8 +1075,17 @@ def _build_concept_context(
     concept: dict[str, Any],
     jwt: str,
     masterfiles_cache: dict[tuple[int, str, str], bytes],
-) -> tuple[str, bool, int, dict[str, Any]]:
+    *,
+    relevance_terms: str = "",
+) -> tuple[str, str, bool, int, dict[str, Any]]:
+    """Return (authored context, workspace file text, files_included, chars, scope info).
+
+    The authored atoms and the workspace file dump are kept apart so the prompt can
+    weight them differently: a shared workspace archive is evidence about the whole
+    lesson, while the atoms are evidence about this concept alone.
+    """
     lines: list[str] = []
+    file_blocks: list[str] = []
     files_included = False
     files_chars = 0
     scope_paths: list[str] = []
@@ -936,13 +1093,14 @@ def _build_concept_context(
     unresolved = False
 
     for atom in concept.get("atoms") or []:
-        workspace_files = ""
-        scope: dict[str, Any] = {}
         if _is_workspace_atom(atom) and jwt:
-            workspace_files, scope = _workspace_files_for_atom(atom, jwt, masterfiles_cache)
+            workspace_files, scope = _workspace_files_for_atom(
+                atom, jwt, masterfiles_cache, relevance_terms=relevance_terms
+            )
             if workspace_files:
                 files_included = True
                 files_chars += len(workspace_files)
+                file_blocks.append(workspace_files)
                 target = scope.get("scope_target") or ""
                 if target:
                     scope_targets.append(target)
@@ -950,7 +1108,7 @@ def _build_concept_context(
                     scope_paths.extend(scope.get("scope_paths") or [])
                 elif target:
                     unresolved = True
-        text = _atom_text(atom, workspace_files_text=workspace_files, workspace_scope=scope)
+        text = _atom_text(atom)
         if text:
             lines.append(text)
 
@@ -968,7 +1126,7 @@ def _build_concept_context(
         "workspace_scope_paths": scope_paths,
         "workspace_default_paths": scope_targets,
     }
-    return "\n".join(lines), files_included, files_chars, scope_info
+    return "\n".join(lines), "\n".join(file_blocks), files_included, files_chars, scope_info
 
 
 def _child_components_from_release(release: dict[str, Any] | None) -> dict[int, dict[str, str]]:
@@ -990,6 +1148,27 @@ def _child_components_from_release(release: dict[str, Any] | None) -> dict[int, 
             "title": (comp.get("title") or "").strip(),
         }
     return out
+
+
+def _is_course_component(child: dict[str, str] | None) -> bool:
+    """Whether a child component is a course rather than a nested lesson library.
+
+    In the dependency graph a course sits at the Part level; a lesson library nested
+    inside one is a Lesson. Skills are scoped per course, so a concept inside such a
+    lesson library must still resolve to the course that contains it.
+    """
+    if not child:
+        return False
+    if (child.get("type") or "").strip().lower() == "part":
+        return True
+    return (child.get("key") or "").strip().lower().startswith("cd")
+
+
+def _course_component(
+    child: dict[str, str] | None,
+    enclosing_course: dict[str, str] | None,
+) -> dict[str, str] | None:
+    return child if _is_course_component(child) else enclosing_course
 
 
 def _enclosing_child_component(
@@ -1041,9 +1220,11 @@ def _workspace_concept_record(
     lesson: dict[str, Any],
     *,
     context: str = "",
+    workspace_files_text: str = "",
     files_included: bool = False,
     files_chars: int = 0,
     child: dict[str, str] | None = None,
+    course: dict[str, str] | None = None,
     scope_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     scope = scope_info or {}
@@ -1052,7 +1233,9 @@ def _workspace_concept_record(
         "concept_title": concept.get("title") or "",
         "lesson_key": lesson.get("key") or "",
         "lesson_title": lesson.get("title") or "",
+        "lesson_summary": _clean(lesson.get("summary")),
         "context_text": context,
+        "workspace_files_text": workspace_files_text,
         "workspace_files_included": files_included,
         "workspace_files_chars": files_chars,
         "workspace_scope_status": scope.get("workspace_scope_status", ""),
@@ -1061,6 +1244,8 @@ def _workspace_concept_record(
         "child_component_key": (child or {}).get("key") or "",
         "child_component_type": (child or {}).get("type") or "",
         "child_component_title": (child or {}).get("title") or "",
+        "course_component_key": (course or {}).get("key") or "",
+        "course_component_title": (course or {}).get("title") or "",
     }
 
 
@@ -1072,29 +1257,42 @@ def _walk_lessons_for_workspace(
     child_by_root_id: dict[int, dict[str, str]],
     parent_branch_id: int | None,
     enclosing_child: dict[str, str] | None,
+    enclosing_course: dict[str, str] | None = None,
+    rank_unscoped_files: bool = True,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for lesson in lessons or []:
         child = _enclosing_child_component(
             lesson, enclosing_child, child_by_root_id, parent_branch_id
         )
+        lesson_course = _course_component(child, enclosing_course)
         for concept in lesson.get("concepts") or []:
             if not _concept_has_workspace(concept):
                 continue
             concept_child = _enclosing_child_component(
                 concept, child, child_by_root_id, parent_branch_id
             )
-            context, files_included, files_chars, scope_info = _build_concept_context(
-                concept, jwt, masterfiles_cache
+            concept_course = _course_component(concept_child, lesson_course)
+            context, files_text, files_included, files_chars, scope_info = _build_concept_context(
+                concept,
+                jwt,
+                masterfiles_cache,
+                relevance_terms=(
+                    f"{concept.get('title') or ''} {lesson.get('title') or ''}"
+                    if rank_unscoped_files
+                    else ""
+                ),
             )
             results.append(
                 _workspace_concept_record(
                     concept,
                     lesson,
                     context=context,
+                    workspace_files_text=files_text,
                     files_included=files_included,
                     files_chars=files_chars,
                     child=concept_child,
+                    course=concept_course,
                     scope_info=scope_info,
                 )
             )
@@ -1104,9 +1302,16 @@ def _walk_lessons_for_workspace(
 def extract_workspace_concepts(
     program: dict[str, Any],
     jwt: str,
+    *,
+    masterfiles_cache: dict[tuple[int, str, str], bytes] | None = None,
+    rank_unscoped_files: bool = True,
 ) -> list[dict[str, Any]]:
-    """Find every workspace concept, including those inside nested child components."""
-    masterfiles_cache: dict[tuple[int, str, str], bytes] = {}
+    """Find every workspace concept, including those inside nested child components.
+
+    masterfiles_cache may be supplied so repeated extractions of the same program
+    reuse already-downloaded archives.
+    """
+    masterfiles_cache = {} if masterfiles_cache is None else masterfiles_cache
     concepts: list[dict[str, Any]] = []
     child_by_root_id = program.get("_child_components") or {}
     parent_branch_id = program.get("_branch_id")
@@ -1121,6 +1326,7 @@ def extract_workspace_concepts(
     def walk(
         lessons: list[dict[str, Any]] | None,
         enclosing: dict[str, str] | None,
+        course: dict[str, str] | None = None,
     ) -> None:
         concepts.extend(
             _walk_lessons_for_workspace(
@@ -1130,6 +1336,8 @@ def extract_workspace_concepts(
                 child_by_root_id=child_by_root_id,
                 parent_branch_id=parent_branch_id,
                 enclosing_child=enclosing,
+                enclosing_course=course,
+                rank_unscoped_files=rank_unscoped_files,
             )
         )
 
@@ -1138,20 +1346,30 @@ def extract_workspace_concepts(
             part_child = _enclosing_child_component(
                 part, None, child_by_root_id, parent_branch_id
             )
+            part_course = _course_component(part_child, None)
             for module in part.get("modules") or []:
                 module_child = _enclosing_child_component(
                     module, part_child, child_by_root_id, parent_branch_id
                 )
-                walk(module.get("lessons"), module_child)
+                walk(
+                    module.get("lessons"),
+                    module_child,
+                    _course_component(module_child, part_course),
+                )
     elif part_modules:
         program_child = _enclosing_child_component(
             program, None, child_by_root_id, parent_branch_id
         )
+        program_course = _course_component(program_child, None)
         for module in part_modules:
             module_child = _enclosing_child_component(
                 module, program_child, child_by_root_id, parent_branch_id
             )
-            walk(module.get("lessons"), module_child)
+            walk(
+                module.get("lessons"),
+                module_child,
+                _course_component(module_child, program_course),
+            )
     elif program.get("concepts"):
         # Analyzing a lesson component directly — its concepts are in-component.
         walk([program], None)
@@ -1159,7 +1377,11 @@ def extract_workspace_concepts(
         program_child = _enclosing_child_component(
             program, None, child_by_root_id, parent_branch_id
         )
-        walk(program.get("lessons") or [], program_child)
+        walk(
+            program.get("lessons") or [],
+            program_child,
+            _course_component(program_child, None),
+        )
     return concepts
 
 
@@ -1228,37 +1450,83 @@ def validate_recommendation(
     return primary, secondaries, None
 
 
+
+
+def _workspace_files_note(concept: dict[str, Any]) -> str:
+    """Tell the model how much of this file listing is actually about this concept."""
+    status = concept.get("workspace_scope_status") or ""
+    scope_paths = concept.get("workspace_scope_paths") or []
+    if status == "scoped" and scope_paths:
+        return (
+            "WORKSPACE FILES — scoped to the exercise folder this concept opens "
+            f"({'; '.join(scope_paths)}). Strong evidence for this concept."
+        )
+    return (
+        "WORKSPACE FILES — NOT scoped to this concept. This is the shared workspace "
+        "archive, so it also contains files belonging to other concepts and other "
+        "lessons. Use it only to confirm what the concept content above already "
+        "indicates. Never choose a skill because a file here relates to it."
+    )
+
+
 def _build_user_prompt(
     program_key: str,
     program_title: str,
     concept: dict[str, Any],
     allowed_skills: list[str],
+    skill_definitions: dict[str, str] | None = None,
 ) -> str:
-    skill_lines = "\n".join(f"- {s}" for s in allowed_skills)
-    scope_paths = concept.get("workspace_scope_paths") or []
-    scope_note = ""
-    if scope_paths:
-        scope_note = (
-            "The workspace files below are only the exercise folder this concept opens "
-            f"({'; '.join(scope_paths)}), not the whole workspace.\n"
-        )
+    # A skill's authored definition states the capability far more precisely than its
+    # name, so it is the thing to match against whenever the taxonomy supplies one.
+    definitions = skill_definitions or {}
+    skill_lines = "\n".join(
+        f"- {s}\n    {definitions[s]}" if definitions.get(s) else f"- {s}"
+        for s in allowed_skills
+    )
     child_key = concept.get("child_component_key") or ""
     child_title = concept.get("child_component_title") or ""
-    library_note = ""
-    if child_key or child_title:
+    course_key = concept.get("course_component_key") or ""
+    course_title = concept.get("course_component_title") or ""
+    placement = [f"PROGRAM: {program_key} — {program_title}"]
+    if course_key or course_title:
+        label = f"{course_key} — {course_title}" if course_key and course_title else (course_key or course_title)
+        placement.append(f"COURSE: {label} (the allowed skills below are this course's own)")
+    if (child_key or child_title) and child_key != course_key:
         label = f"{child_key} — {child_title}" if child_key and child_title else (child_key or child_title)
-        library_note = f"CONTAINING LIBRARY: {label}\n"
-    return (
-        f"PROGRAM: {program_key} — {program_title}\n"
-        f"ALLOWED SKILLS (use exact names from this list only):\n{skill_lines}\n\n"
-        f"{library_note}"
-        f"CONCEPT: {concept.get('concept_title', '')} (key: {concept.get('concept_key', '')})\n"
-        "This concept includes a workspace activity. Tag skills the learner will practice, "
-        "apply, or be meaningfully exposed to by engaging with the workspace and related "
-        "content—not general program themes unrelated to this concept.\n"
-        f"{scope_note}\n"
-        f"CONTENT:\n{concept.get('context_text', '') or '(no extractable content)'}"
+        placement.append(f"CONTAINING LIBRARY: {label}")
+    # The lesson states what this group of concepts is meant to teach, which is the
+    # strongest signal for the intended skill when the files are ambiguous.
+    if concept.get("lesson_title"):
+        placement.append(f"LESSON: {concept['lesson_title']}")
+    if concept.get("lesson_summary"):
+        placement.append(f"LESSON SUMMARY: {concept['lesson_summary']}")
+    placement.append(
+        f"CONCEPT: {concept.get('concept_title', '')} (key: {concept.get('concept_key', '')})"
     )
+
+    sections = [
+        "\n".join(placement),
+        "CONCEPT CONTENT — authored for this concept (text, video, quizzes, workspace "
+        "instructions). This is the primary evidence.\n"
+        + (concept.get("context_text") or "(no extractable content)"),
+    ]
+    files_text = concept.get("workspace_files_text") or ""
+    if files_text:
+        sections.append(f"{_workspace_files_note(concept)}\n{files_text}")
+
+    skills_header = "ALLOWED SKILLS (use exact names from this list only)"
+    if any(definitions.get(s) for s in allowed_skills):
+        skills_header += (
+            ". Each name is followed by its official definition — match the learner's "
+            "work against the definition, not against the wording of the name"
+        )
+    sections.append(f"{skills_header}:\n{skill_lines}")
+    sections.append(
+        "TASK: name the one allowed skill this concept's learner work demonstrates, "
+        "plus up to 2 allowed skills it only touches. Decide from what the learner does "
+        "in this concept within its lesson, not from general program themes."
+    )
+    return "\n\n".join(sections)
 
 
 def _normalize_rationale(text: str) -> str:
@@ -1285,6 +1553,41 @@ secondary_skills — 0 to 2 ADJACENT skills the concept only touches: used incid
 encountered in passing, provided already-written in the starter code, or read about \
 without being practiced. The learner does NOT demonstrate these; they are neighbours of \
 the primary skill, not runners-up for it.
+
+How to choose between candidate skills:
+- When a skill is listed with a definition, the definition is authoritative and the \
+name is only a label. Match the learner's work against the definitions, and prefer a \
+skill whose definition describes that work over one whose name happens to share \
+wording with the content.
+- Skill names are abstract capability labels, not keywords to find in the content. A \
+concept usually teaches a named technique, pattern, or tool, and the skill is the \
+capability that technique produces. Translate the technique into the capability before \
+matching. The right skill is often one whose words appear nowhere in the content, and a \
+skill whose words appear verbatim is not automatically right.
+- Consider EVERY skill in the allowed list before deciding, including ones with no \
+lexical overlap with the content. Then name the best fit.
+- When two allowed skills differ only by a qualifier (a scope, a modality, a count of \
+agents, a layer of the stack), the qualifier decides. Choose the skill whose qualifier \
+the evidence satisfies, even when the other name is shorter, more general, or more \
+familiar. Never fall back to the broader name just because it also fits loosely.
+- A lesson title that contains the words of several skills is not a vote for any of \
+them; read what the learner actually builds.
+- Beware the skill that merely echoes the content's vocabulary. The name a concept uses \
+for its pattern is often not the wording of the skill it teaches, so the highest word \
+overlap frequently belongs to a different, neighbouring skill. Decide which capability \
+the work produces, then find its label.
+- Fill concept_technique and capability_gained first and answer from them. If the skill \
+you are about to name does not restate capability_gained, it is the wrong skill.
+
+How to weigh the evidence:
+- The concept content is authoritative. Workspace files are corroboration.
+- A workspace archive marked as NOT scoped to the concept is shared across the lesson \
+or course: it lists files belonging to other concepts and other lessons. Never pick a \
+skill because some file in an unscoped listing relates to it. If the only support for a \
+skill is a filename in such a listing, it is not the primary skill, and usually not a \
+secondary one either.
+- When the content is thin, fall back to the lesson title and summary — that is what \
+this concept is part of teaching — rather than to whatever files are visible.
 
 Rules:
 - Copy skill names EXACTLY from the allowed list (same spelling and casing).
@@ -1468,8 +1771,11 @@ def tag_concept(
     consensus_enabled: bool = True,
     n_runs: int = 3,
     model: str = DEFAULT_MODEL,
+    skill_definitions: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    user_prompt = _build_user_prompt(program_key, program_title, concept, allowed_skills)
+    user_prompt = _build_user_prompt(
+        program_key, program_title, concept, allowed_skills, skill_definitions
+    )
     if consensus_enabled and n_runs > 1:
         outcome = run_with_consensus(
             api_key,
@@ -1504,6 +1810,8 @@ def tag_concept(
             "child_component_key": concept.get("child_component_key", ""),
             "child_component_type": concept.get("child_component_type", ""),
             "child_component_title": concept.get("child_component_title", ""),
+            "course_component_key": concept.get("course_component_key", ""),
+            "course_component_title": concept.get("course_component_title", ""),
         }
 
     # Single run
@@ -1541,6 +1849,8 @@ def tag_concept(
         "child_component_key": concept.get("child_component_key", ""),
         "child_component_type": concept.get("child_component_type", ""),
         "child_component_title": concept.get("child_component_title", ""),
+        "course_component_key": concept.get("course_component_key", ""),
+        "course_component_title": concept.get("course_component_title", ""),
     }
 
 
@@ -1588,6 +1898,42 @@ def analyze_program(
             "The program may lack skill metadata or the JWT cannot read it."
         )
 
+    # A concept is tagged against the skills its own course teaches, not against every
+    # skill in the nanodegree: a sibling course's skill is never the right answer, and
+    # offering it is what lets a neighbouring course's wording win. A course's list is
+    # its own teaches_skills plus those of the lesson libraries nested inside it, so a
+    # course that declares none still offers what its lessons teach.
+    # course_of maps a course to itself and every nested component to its course.
+    course_of = program.get("_course_of_component") or {}
+    grouped: dict[str, list[list[str]]] = {}
+    for key, md in child_metadata.items():
+        course_key = course_of.get(key, "")
+        if not course_key:
+            continue
+        grouped.setdefault(course_key, []).append(
+            _skills_from_metadata(md, include_prerequisites=include_prerequisites)
+        )
+    skills_by_course = {
+        course_key: _merge_skill_lists(*lists) for course_key, lists in grouped.items()
+    }
+    # A one-skill allowlist dictates the answer instead of asking for a recommendation,
+    # so fall back to the program-wide list rather than rubber-stamping it.
+    skills_by_course = {
+        k: v for k, v in skills_by_course.items() if len(v) >= MIN_ALLOWLIST_SKILLS
+    }
+
+    _progress("Fetching skill definitions...")
+    skill_entries: list[dict[str, str]] = []
+    seen_skills: set[str] = set()
+    for source in (metadata, *child_metadata.values()):
+        for entry in _skill_entries_from_metadata(
+            source, include_prerequisites=include_prerequisites
+        ):
+            if entry["name"] not in seen_skills:
+                seen_skills.add(entry["name"])
+                skill_entries.append(entry)
+    skill_definitions = fetch_skill_definitions(jwt, skill_entries)
+
     program_title = program.get("title") or program_key
     _progress("Extracting workspace concepts and starter files...")
     workspace_concepts = extract_workspace_concepts(program, jwt)
@@ -1612,6 +1958,10 @@ def analyze_program(
     results: list[dict[str, Any] | None] = [None] * total
     # A nanodegree can hold 100+ workspace concepts; tagged one at a time that is
     # tens of minutes of round-trips, so fan them out. Results stay in concept order.
+    def _allowed_for(concept: dict[str, Any]) -> list[str]:
+        course_key = concept.get("course_component_key") or ""
+        return skills_by_course.get(course_key) or allowed_skills
+
     workers = max(1, min(TAG_MAX_WORKERS, total))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
@@ -1621,10 +1971,11 @@ def analyze_program(
                 program_key,
                 program_title,
                 concept,
-                allowed_skills,
+                _allowed_for(concept),
                 consensus_enabled=consensus_enabled,
                 n_runs=n_runs,
                 model=model,
+                skill_definitions=skill_definitions,
             ): i
             for i, concept in enumerate(workspace_concepts)
         }
@@ -1646,6 +1997,8 @@ def analyze_program(
             "locale": program.get("_resolved_locale"),
             "unreleased": program.get("_unreleased", False),
             "child_component_keys": sorted(child_metadata),
+            "skill_definitions": skill_definitions,
+            "skills_by_course": skills_by_course,
             "workspace_concept_count": len(workspace_concepts),
         },
         "workspace_concepts": workspace_concepts,

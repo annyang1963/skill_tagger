@@ -478,9 +478,10 @@ st.markdown(
     "Enter a **cd** or **nd** key, find concepts with workspaces, and recommend "
     "the one program-level skill each concept **demonstrates**, plus up to 2 "
     "adjacent skills it only **touches**. "
-    "Concepts in a nested child library (for example an **ls** lesson library "
-    "inside a **cd**) are tagged too, and that "
-    "library's own teaches_skills are added to the allowlist."
+    "Each concept is tagged against its own course's teaches_skills, so a sibling "
+    "course's skill can never be assigned. Concepts in a nested child library (for "
+    "example an **ls** lesson library inside a **cd**) are tagged too, using the "
+    "skills of the course that contains them."
 )
 
 _render_data_flow_expander()
@@ -573,8 +574,8 @@ st.markdown(
     "incidentally or encountered, not demonstrated. Primary is decided by which "
     "skill most runs named as primary; adjacent skills are those a majority agreed on. "
     "Low-confidence skills fell short of that majority. "
-    "Concepts inside a nested child library are tagged too, and that library's own "
-    "teaches_skills are added to the allowlist above."
+    "The skills above are every skill in the program; each concept was tagged against "
+    "the subset its own course teaches."
 )
 
 if view_mode == "Table":
