@@ -10,5 +10,15 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
+# Local-only evaluation: the harness and the runs it caches
+eval_harness.py
+runs/
+
+# Editor config
+.vscode/
+
 # OS
 .DS_Store
+# UContent Tools: generated agent skills (refreshed by the extension)
+.cursor/skills/ucontent-*/
+.claude/skills/ucontent-*/
